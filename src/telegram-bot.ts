@@ -209,14 +209,21 @@ async function runAgent(chatId: number, userText: string): Promise<string> {
   history.push({ role: "user", content: userText });
 
   const now = new Date();
-  const SYSTEM = `You are a personal AI assistant. You have access to Google Calendar, Gmail, and Apple Reminders.
+  // Israel time = UTC+3 (summer, Asia/Jerusalem)
+  const israelOffset = 3 * 60 * 60 * 1000;
+  const israelNow = new Date(now.getTime() + israelOffset);
+  const israelTimeStr = israelNow.toISOString().replace("Z", "+03:00");
+
+  const SYSTEM = `You are a personal AI assistant. You have access to Google Calendar, Gmail, and Google Tasks.
 Always reply in the same language the user writes in (Hebrew or English). Be concise and direct.
 NEVER ask the user for clarification before acting — make your best judgment and call the tool immediately.
 
-Current date/time: ${now.toISOString()} (Israel time = UTC+3)
+Current Israel date/time: ${israelTimeStr}
+IMPORTANT: All times the user mentions are in Israel time (UTC+3). When generating ISO 8601 datetimes, ALWAYS include the +03:00 suffix. Example: 17:20 today → ${israelTimeStr.slice(0,11)}17:20:00+03:00
 
 ## Adding calendar events — rules:
 - ALWAYS use add_calendar_event (not quick_add_calendar_event) for any Hebrew input.
+- ALWAYS include +03:00 suffix in all datetimes: e.g. '2026-05-25T17:20:00+03:00'
 - For recurring events, use the recurrence field with RRULE strings:
   - "כל שבוע ביום X" → ["RRULE:FREQ=WEEKLY;BYDAY=<MO/TU/WE/TH/FR/SA/SU>"]
   - "כל יום" → ["RRULE:FREQ=DAILY"]
@@ -239,7 +246,8 @@ Current date/time: ${now.toISOString()} (Israel time = UTC+3)
 
 ## Adding tasks — rules:
 - ALWAYS call add_task when the user asks to remember something or add a task.
-- Convert relative Hebrew times to ISO 8601: "מחר"=tomorrow, "היום"=today, "בבוקר"=08:00, "בצהריים"=12:00, "אחה"צ"=15:00, "בערב"=18:00, "בלילה"=21:00.
+- ALWAYS include +03:00 suffix in due dates: e.g. '2026-05-25T17:20:00+03:00'
+- "בבוקר"=08:00, "בצהריים"=12:00, "אחה"צ"=15:00, "בערב"=18:00, "בלילה"=21:00.
 - If no time given, use 09:00 on the implied day.
 - After adding, confirm with: ✅ נוסף: "<title>" ל-<formatted date>`.replace(/\n\n+/g, "\n\n");
 
