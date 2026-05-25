@@ -10,7 +10,7 @@ import { tmpdir } from "os";
 import { pipeline } from "stream/promises";
 import { fileURLToPath } from "url";
 import { dirname } from "path";
-import { getReminders, addReminder } from "./reminders.js";
+import { getTasks, addTask, completeTask } from "./google-tasks.js";
 import { getCalendarEvents, quickAddCalendarEvent, addCalendarEvent } from "./google-calendar.js";
 import { getUnreadEmails, sendEmail } from "./google-gmail.js";
 
@@ -36,8 +36,8 @@ const histories = new Map<number, Anthropic.MessageParam[]>();
 
 const TOOLS: Anthropic.Tool[] = [
   {
-    name: "get_reminders",
-    description: "Fetch incomplete reminders from Apple Reminders. Optionally filter by list name.",
+    name: "get_tasks",
+    description: "Fetch incomplete tasks from Google Tasks. Optionally filter by list name.",
     input_schema: {
       type: "object",
       properties: {
@@ -46,17 +46,29 @@ const TOOLS: Anthropic.Tool[] = [
     },
   },
   {
-    name: "add_reminder",
-    description: "Create a new reminder/task in Apple Reminders. Always use this when the user asks to remember something or add a task. Convert any relative date (מחר, היום, בערב etc.) to full ISO 8601 before calling.",
+    name: "add_task",
+    description: "Create a new task in Google Tasks. ALWAYS use this when the user asks to remember something or add a task. Convert relative dates (מחר, היום, בערב etc.) to ISO 8601 before calling.",
     input_schema: {
       type: "object",
       properties: {
-        title: { type: "string", description: "Reminder title in the user's language." },
+        title: { type: "string", description: "Task title in the user's language." },
         listName: { type: "string", description: "Target list name (optional, defaults to first list)." },
-        dueDate: { type: "string", description: "Due date as full ISO 8601, e.g. '2026-05-25T09:00:00'. Always include time." },
+        due: { type: "string", description: "Due date as ISO 8601, e.g. '2026-05-25T09:00:00'." },
         notes: { type: "string", description: "Extra notes (optional)." },
       },
       required: ["title"],
+    },
+  },
+  {
+    name: "complete_task",
+    description: "Mark a Google Task as completed. Use the task id and listId from get_tasks.",
+    input_schema: {
+      type: "object",
+      properties: {
+        taskId: { type: "string", description: "Task ID." },
+        listId: { type: "string", description: "List ID the task belongs to." },
+      },
+      required: ["taskId", "listId"],
     },
   },
   {
@@ -133,13 +145,16 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
   try {
     let out: string;
     switch (name) {
-      case "get_reminders":
-        out = JSON.stringify(await getReminders(input.listName as string | undefined), null, 2); break;
-      case "add_reminder":
+      case "get_tasks":
+        out = JSON.stringify(await getTasks(input.listName as string | undefined), null, 2); break;
+      case "add_task":
         out = JSON.stringify(
-          await addReminder(input.title as string, input.listName as string | undefined, input.dueDate as string | undefined, input.notes as string | undefined),
+          await addTask(input.title as string, input.listName as string | undefined, input.due as string | undefined, input.notes as string | undefined),
           null, 2
         ); break;
+      case "complete_task":
+        await completeTask(input.taskId as string, input.listId as string);
+        out = JSON.stringify({ ok: true }); break;
       case "get_calendar_events":
         out = JSON.stringify(
           await getCalendarEvents(input.timeMin as string | undefined, input.timeMax as string | undefined),
@@ -217,8 +232,8 @@ Current date/time: ${now.toISOString()} (Israel time = UTC+3)
 - Only call send_email after the user explicitly confirms (e.g. "כן", "שלח", "yes").
 - After sending confirm: ✅ המייל נשלח!
 
-## Adding reminders — rules:
-- ALWAYS call add_reminder when the user asks to be reminded of something or add a task.
+## Adding tasks — rules:
+- ALWAYS call add_task when the user asks to remember something or add a task.
 - Convert relative Hebrew times to ISO 8601: "מחר"=tomorrow, "היום"=today, "בבוקר"=08:00, "בצהריים"=12:00, "אחה"צ"=15:00, "בערב"=18:00, "בלילה"=21:00.
 - If no time given, use 09:00 on the implied day.
 - After adding, confirm with: ✅ נוסף: "<title>" ל-<formatted date>`.replace(/\n\n+/g, "\n\n");
