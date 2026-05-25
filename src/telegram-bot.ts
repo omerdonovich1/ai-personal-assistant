@@ -1,4 +1,9 @@
 import "dotenv/config";
+// Polyfill File global for older Node versions (required by Groq SDK for audio uploads)
+if (!globalThis.File) {
+  const { File } = await import("node:buffer");
+  (globalThis as unknown as Record<string, unknown>).File = File;
+}
 import { Bot } from "grammy";
 import Anthropic from "@anthropic-ai/sdk";
 import Groq from "groq-sdk";
