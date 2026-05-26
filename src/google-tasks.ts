@@ -69,7 +69,13 @@ export async function addTask(
   let list = lists[0];
   if (listName) {
     const found = lists.find((l) => l.title.toLowerCase().includes(listName.toLowerCase()));
-    if (found) list = found;
+    if (found) {
+      list = found;
+    } else {
+      // Create the list if it doesn't exist
+      const created = await tasks.tasklists.insert({ requestBody: { title: listName } });
+      list = { id: created.data.id ?? "", title: created.data.title ?? listName };
+    }
   }
 
   const body: { title: string; notes?: string; due?: string } = { title };
