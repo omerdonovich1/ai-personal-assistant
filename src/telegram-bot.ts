@@ -8,16 +8,17 @@ import { Bot } from "grammy";
 import Anthropic from "@anthropic-ai/sdk";
 import Groq from "groq-sdk";
 import cron from "node-cron";
-import { createWriteStream, existsSync } from "fs";
+import { createWriteStream } from "fs";
 import { unlink, readFile, writeFile } from "fs/promises";
 import { join } from "path";
 import { tmpdir } from "os";
 import { pipeline } from "stream/promises";
 import { fileURLToPath } from "url";
 import { dirname } from "path";
-import { getTasks, addTask, completeTask } from "./google-tasks.js";
+import { getTasks, addTask, completeTask, getTaskLists } from "./google-tasks.js";
 import { getCalendarEvents, quickAddCalendarEvent, addCalendarEvent } from "./google-calendar.js";
 import { getUnreadEmails, sendEmail } from "./google-gmail.js";
+import { loadReminders, upsertReminder, deleteReminder, type Reminder } from "./reminder-store.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CHAT_ID_FILE = join(__dirname, "..", "data", "chat-id.json");
@@ -37,6 +38,47 @@ const groq = new Groq({ apiKey: GROQ_KEY });
 // Conversation history per chat (in-memory)
 const histories = new Map<number, Anthropic.MessageParam[]>();
 
+// Active reminder timeouts — keyed by reminder id
+const scheduledTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
+
+// ── Reminder scheduling ───────────────────────────────────────────────────────
+
+function scheduleReminder(r: Reminder): void {
+  const msUntilFire = new Date(r.fireAt).getTime() - Date.now();
+  if (msUntilFire <= 0) {
+    // Already past — fire immediately then clean up
+    fireReminder(r);
+    return;
+  }
+  // Node's setTimeout max is ~24.8 days; for longer reminders re-schedule closer to fire time
+  const delay = Math.min(msUntilFire, 2_147_483_647);
+  const timeout = setTimeout(async () => {
+    if (msUntilFire > 2_147_483_647) {
+      // Not ready yet — re-schedule
+      scheduleReminder(r);
+    } else {
+      await fireReminder(r);
+    }
+  }, delay);
+  scheduledTimeouts.set(r.id, timeout);
+}
+
+async function fireReminder(r: Reminder): Promise<void> {
+  scheduledTimeouts.delete(r.id);
+  await deleteReminder(r.id);
+  try {
+    await bot.api.sendMessage(r.chatId, `⏰ תזכורת: ${r.text}`);
+    console.log(`[reminder:fired] ${r.id} — "${r.text}"`);
+  } catch (err) {
+    console.error(`[reminder:error] ${r.id}:`, err);
+  }
+}
+
+function cancelScheduled(id: string): void {
+  const t = scheduledTimeouts.get(id);
+  if (t) { clearTimeout(t); scheduledTimeouts.delete(id); }
+}
+
 // ── Tool definitions ──────────────────────────────────────────────────────────
 
 const TOOLS: Anthropic.Tool[] = [
@@ -52,13 +94,13 @@ const TOOLS: Anthropic.Tool[] = [
   },
   {
     name: "add_task",
-    description: "Create a new task in Google Tasks. ALWAYS use this when the user asks to remember something or add a task. Convert relative dates (מחר, היום, בערב etc.) to ISO 8601 before calling.",
+    description: "Create a new task in Google Tasks. Call this IMMEDIATELY whenever the user asks to add a task or remember something. Do NOT confirm without calling this first.",
     input_schema: {
       type: "object",
       properties: {
         title: { type: "string", description: "Task title in the user's language." },
-        listName: { type: "string", description: "Target list name (optional, defaults to first list)." },
-        due: { type: "string", description: "Due date as ISO 8601, e.g. '2026-05-25T09:00:00'." },
+        listName: { type: "string", description: "Target list name (optional)." },
+        due: { type: "string", description: "Due date as ISO 8601 with +03:00 suffix, e.g. '2026-05-25T09:00:00+03:00'." },
         notes: { type: "string", description: "Extra notes (optional)." },
       },
       required: ["title"],
@@ -78,12 +120,12 @@ const TOOLS: Anthropic.Tool[] = [
   },
   {
     name: "get_calendar_events",
-    description: "Fetch upcoming Google Calendar events. Defaults to next 7 days if no range given. For 'today' or 'tomorrow' queries, omit parameters and let the default handle it, or pass full ISO 8601 strings like '2026-05-25T00:00:00Z'.",
+    description: "Fetch upcoming Google Calendar events. Defaults to next 7 days.",
     input_schema: {
       type: "object",
       properties: {
-        timeMin: { type: "string", description: "Start of range, full ISO 8601 e.g. '2026-05-25T00:00:00Z'. Optional." },
-        timeMax: { type: "string", description: "End of range, full ISO 8601 e.g. '2026-05-25T23:59:59Z'. Optional." },
+        timeMin: { type: "string", description: "Start of range, ISO 8601. Optional." },
+        timeMax: { type: "string", description: "End of range, ISO 8601. Optional." },
       },
     },
   },
@@ -100,19 +142,19 @@ const TOOLS: Anthropic.Tool[] = [
   },
   {
     name: "add_calendar_event",
-    description: "Create a Google Calendar event with structured data. ALWAYS use this (not quick_add_calendar_event) when the user speaks Hebrew or provides explicit date/time. Supports recurring events via RRULE. Convert relative times like 'מחר', 'היום', 'בבוקר' to full ISO 8601 before calling. NEVER ask the user for clarification about recurring events — just use the correct RRULE.",
+    description: "Create a Google Calendar event with structured data. ALWAYS use this for Hebrew. Supports recurring events via RRULE.",
     input_schema: {
       type: "object",
       properties: {
-        summary: { type: "string", description: "Event title in the user's language." },
-        startDateTime: { type: "string", description: "Start time as full ISO 8601, e.g. '2026-05-25T10:00:00'. Required." },
-        endDateTime: { type: "string", description: "End time as full ISO 8601. If no duration given, default to 1 hour after start." },
+        summary: { type: "string", description: "Event title." },
+        startDateTime: { type: "string", description: "Start time, ISO 8601 with +03:00. Required." },
+        endDateTime: { type: "string", description: "End time, ISO 8601 with +03:00. Default: 1 hour after start." },
         description: { type: "string", description: "Optional event notes." },
         location: { type: "string", description: "Optional location." },
         recurrence: {
           type: "array",
           items: { type: "string" },
-          description: "RRULE strings for recurring events. Examples: weekly on Sunday = ['RRULE:FREQ=WEEKLY;BYDAY=SU'], every weekday = ['RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR'], daily = ['RRULE:FREQ=DAILY'], weekly on Mon+Wed+Thu = ['RRULE:FREQ=WEEKLY;BYDAY=MO,WE,TH']. Use this whenever the user says 'כל שבוע', 'כל יום', 'כל ראשון' etc.",
+          description: "RRULE strings. E.g. weekly Sunday: ['RRULE:FREQ=WEEKLY;BYDAY=SU'], daily: ['RRULE:FREQ=DAILY'].",
         },
       },
       required: ["summary", "startDateTime", "endDateTime"],
@@ -120,32 +162,60 @@ const TOOLS: Anthropic.Tool[] = [
   },
   {
     name: "get_unread_emails",
-    description: "Fetch unread Gmail emails (sender, subject, snippet, date).",
+    description: "Fetch unread Gmail emails.",
     input_schema: {
       type: "object",
       properties: {
-        maxResults: { type: "number", description: "Number of emails to return (1-20, default 5)." },
+        maxResults: { type: "number", description: "1-20, default 5." },
       },
     },
   },
   {
     name: "send_email",
-    description: "Send an email from omer.donovich@gmail.com. ONLY call this after the user has explicitly confirmed they want to send. Never send without confirmation.",
+    description: "Send an email. ONLY call after the user explicitly confirms. Never send without confirmation.",
     input_schema: {
       type: "object",
       properties: {
-        to: { type: "string", description: "Recipient email address." },
-        subject: { type: "string", description: "Email subject." },
-        body: { type: "string", description: "Email body in plain text." },
+        to: { type: "string" },
+        subject: { type: "string" },
+        body: { type: "string" },
       },
       required: ["to", "subject", "body"],
+    },
+  },
+  {
+    name: "set_reminder",
+    description: "Set a reminder that sends a Telegram message at a specific time. Call this IMMEDIATELY when the user says 'תזכיר לי', 'remind me', 'in X hours', etc.",
+    input_schema: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "What to remind the user about." },
+        fireAt: { type: "string", description: "When to fire, ISO 8601 with +03:00. E.g. '2026-05-26T15:00:00+03:00'." },
+      },
+      required: ["text", "fireAt"],
+    },
+  },
+  {
+    name: "list_reminders",
+    description: "List all pending reminders for the user.",
+    input_schema: { type: "object", properties: {} },
+  },
+  {
+    name: "cancel_reminder",
+    description: "Cancel a pending reminder by its ID (from list_reminders).",
+    input_schema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Reminder ID." },
+      },
+      required: ["id"],
     },
   },
 ];
 
 // ── Tool executor ─────────────────────────────────────────────────────────────
 
-async function executeTool(name: string, input: Record<string, unknown>): Promise<string> {
+async function executeTool(name: string, input: Record<string, unknown>, chatId: number): Promise<string> {
   console.log(`[tool:call] ${name}`, JSON.stringify(input));
   try {
     let out: string;
@@ -183,6 +253,23 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
           await sendEmail(input.to as string, input.subject as string, input.body as string),
           null, 2
         ); break;
+      case "set_reminder": {
+        const id = `r_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+        const reminder: Reminder = { id, chatId, text: input.text as string, fireAt: input.fireAt as string };
+        await upsertReminder(reminder);
+        scheduleReminder(reminder);
+        out = JSON.stringify({ id, text: reminder.text, fireAt: reminder.fireAt }); break;
+      }
+      case "list_reminders": {
+        const all = await loadReminders();
+        out = JSON.stringify(all.filter((r) => r.chatId === chatId), null, 2); break;
+      }
+      case "cancel_reminder": {
+        const rid = input.id as string;
+        cancelScheduled(rid);
+        await deleteReminder(rid);
+        out = JSON.stringify({ ok: true }); break;
+      }
       default:
         out = `Unknown tool: ${name}`;
     }
@@ -209,47 +296,42 @@ async function runAgent(chatId: number, userText: string): Promise<string> {
   history.push({ role: "user", content: userText });
 
   const now = new Date();
-  // Israel time = UTC+3 (summer, Asia/Jerusalem)
   const israelOffset = 3 * 60 * 60 * 1000;
   const israelNow = new Date(now.getTime() + israelOffset);
   const israelTimeStr = israelNow.toISOString().replace("Z", "+03:00");
+  const israelDateStr = israelTimeStr.slice(0, 10);
 
-  const SYSTEM = `You are a personal AI assistant. You have access to Google Calendar, Gmail, and Google Tasks.
+  const SYSTEM = `You are a personal AI assistant. You have access to Google Calendar, Gmail, Google Tasks, and reminders.
 Always reply in the same language the user writes in (Hebrew or English). Be concise and direct.
 NEVER ask the user for clarification before acting — make your best judgment and call the tool immediately.
+NEVER confirm an action without first calling the appropriate tool. The tool call must happen first, then the confirmation.
 
 Current Israel date/time: ${israelTimeStr}
-IMPORTANT: All times the user mentions are in Israel time (UTC+3). When generating ISO 8601 datetimes, ALWAYS include the +03:00 suffix. Example: 17:20 today → ${israelTimeStr.slice(0,11)}17:20:00+03:00
+IMPORTANT: All times the user mentions are in Israel time (UTC+3). Always include +03:00 suffix in ISO 8601 strings.
+Example: 17:20 today → ${israelDateStr}T17:20:00+03:00
+
+## Adding tasks — CRITICAL rules:
+- ALWAYS call add_task FIRST, then confirm. Never say "נוסף" without calling the tool.
+- If the user says "תוסיף משימה X" or "תזכור ש..." — call add_task immediately, no questions.
+- "בבוקר"=08:00, "בצהריים"=12:00, "אחה\"צ"=15:00, "בערב"=18:00, "בלילה"=21:00. No time → 09:00.
+- After successful tool call confirm: ✅ נוסף: "<title>" ל-<formatted date>
+
+## Setting reminders — CRITICAL rules:
+- ALWAYS call set_reminder FIRST when user says "תזכיר לי", "remind me", "בעוד X דקות/שעות".
+- "בעוד שעה" = ${israelDateStr}T${String(israelNow.getUTCHours() + 1).padStart(2, "0")}:${String(israelNow.getUTCMinutes()).padStart(2, "0")}:00+03:00
+- "בשעה X" = today at time X. "מחר בשעה X" = tomorrow at X.
+- After successful tool call confirm: ✅ תזכורת הוגדרה: "<text>" ב-<formatted time>
 
 ## Adding calendar events — rules:
-- ALWAYS use add_calendar_event (not quick_add_calendar_event) for any Hebrew input.
-- ALWAYS include +03:00 suffix in all datetimes: e.g. '2026-05-25T17:20:00+03:00'
-- For recurring events, use the recurrence field with RRULE strings:
-  - "כל שבוע ביום X" → ["RRULE:FREQ=WEEKLY;BYDAY=<MO/TU/WE/TH/FR/SA/SU>"]
-  - "כל יום" → ["RRULE:FREQ=DAILY"]
-  - "כל ראשון" → ["RRULE:FREQ=WEEKLY;BYDAY=SU"]
-  - Multiple days "ראשון, שלישי, חמישי" → ["RRULE:FREQ=WEEKLY;BYDAY=SU,TU,TH"]
-- If no end time given, default to 1 hour after start.
-- After adding, confirm: ✅ נוסף ליומן: "<title>"
+- ALWAYS use add_calendar_event (not quick_add_calendar_event) for Hebrew input.
+- For recurring: "כל שבוע ביום X" → ["RRULE:FREQ=WEEKLY;BYDAY=<day>"], "כל יום" → ["RRULE:FREQ=DAILY"].
+- No end time given → default 1 hour after start.
+- After adding confirm: ✅ נוסף ליומן: "<title>"
 
 ## Sending emails — rules:
-- When the user asks to send an email, FIRST draft it and show them exactly:
-  📧 **נמען:** <to>
-  **נושא:** <subject>
-  **תוכן:**
-  <body>
-
-  האם לשלוח?
-- Do NOT call send_email yet.
-- Only call send_email after the user explicitly confirms (e.g. "כן", "שלח", "yes").
-- After sending confirm: ✅ המייל נשלח!
-
-## Adding tasks — rules:
-- ALWAYS call add_task when the user asks to remember something or add a task.
-- ALWAYS include +03:00 suffix in due dates: e.g. '2026-05-25T17:20:00+03:00'
-- "בבוקר"=08:00, "בצהריים"=12:00, "אחה"צ"=15:00, "בערב"=18:00, "בלילה"=21:00.
-- If no time given, use 09:00 on the implied day.
-- After adding, confirm with: ✅ נוסף: "<title>" ל-<formatted date>`.replace(/\n\n+/g, "\n\n");
+- FIRST draft and show the email, ask "האם לשלוח?". Do NOT call send_email yet.
+- Only call send_email after explicit user confirmation ("כן", "שלח", "yes").
+- After sending confirm: ✅ המייל נשלח!`;
 
   const messages = [...history];
 
@@ -265,7 +347,6 @@ IMPORTANT: All times the user mentions are in Israel time (UTC+3). When generati
     messages.push({ role: "assistant", content: response.content });
 
     if (response.stop_reason === "tool_use") {
-      // Run all requested tools IN PARALLEL
       const toolBlocks = response.content.filter(
         (b): b is Anthropic.ToolUseBlock => b.type === "tool_use"
       );
@@ -273,7 +354,7 @@ IMPORTANT: All times the user mentions are in Israel time (UTC+3). When generati
         toolBlocks.map(async (block) => ({
           type: "tool_result" as const,
           tool_use_id: block.id,
-          content: await executeTool(block.name, block.input as Record<string, unknown>),
+          content: await executeTool(block.name, block.input as Record<string, unknown>, chatId),
         }))
       );
       messages.push({ role: "user", content: toolResults });
@@ -290,12 +371,11 @@ IMPORTANT: All times the user mentions are in Israel time (UTC+3). When generati
   }
 }
 
-// ── Chat ID persistence (for scheduled messages) ──────────────────────────────
+// ── Chat ID persistence ────────────────────────────────────────────────────────
 
 let registeredChatId: number | null = null;
 
 async function loadChatId(): Promise<void> {
-  // Env var takes priority (for Railway deployment)
   if (process.env.TELEGRAM_CHAT_ID) {
     registeredChatId = Number(process.env.TELEGRAM_CHAT_ID);
     console.log("Loaded chat ID from env:", registeredChatId);
@@ -312,9 +392,20 @@ async function loadChatId(): Promise<void> {
 
 async function saveChatId(chatId: number): Promise<void> {
   const dir = join(__dirname, "..", "data");
-  await import("fs").then(fs => fs.mkdirSync(dir, { recursive: true }));
+  await import("fs").then((fs) => fs.mkdirSync(dir, { recursive: true }));
   await writeFile(CHAT_ID_FILE, JSON.stringify({ chatId }));
   registeredChatId = chatId;
+}
+
+// ── Google Auth health check ──────────────────────────────────────────────────
+
+async function checkGoogleAuth(): Promise<boolean> {
+  try {
+    await getTaskLists();
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // ── Scheduled push messages ───────────────────────────────────────────────────
@@ -329,10 +420,10 @@ async function sendScheduled(prompt: string): Promise<void> {
   }
 }
 
-// 07:00 — morning brief
+// 07:00 — morning brief (calendar + tasks + urgent emails)
 cron.schedule("0 7 * * *", () => {
   sendScheduled(
-    "בוקר טוב! תן לי בריף יומי קצר ומסודר: מה יש לי ביומן היום, תזכורות פתוחות, ואם יש מיילים דחופים שצריך לדעת עליהם. שמור את זה קצר וענייני."
+    "בוקר טוב! תן לי בריף יומי קצר ומסודר:\n1. מה יש לי ביומן היום\n2. משימות פתוחות ב-Google Tasks\n3. מיילים דחופים שצריך לדעת עליהם\nשמור על קיצור וענייניות."
   );
 }, { timezone: "Asia/Jerusalem" });
 
@@ -343,6 +434,19 @@ cron.schedule("0 22 * * *", () => {
   );
 }, { timezone: "Asia/Jerusalem" });
 
+// Every Sunday 09:00 — auth health check
+cron.schedule("0 9 * * 0", async () => {
+  const ok = await checkGoogleAuth();
+  if (!ok && registeredChatId) {
+    await bot.api.sendMessage(
+      registeredChatId,
+      "⚠️ *Google Auth Warning*\n\nהטוקן של גוגל עשוי לפוג או כבר פג.\n\nכדי לחדש:\n1. הרץ את הבוט לוקאלית: `npm run bot`\n2. אשר OAuth בדפדפן\n3. עדכן `GOOGLE_TOKEN_JSON` ב-Railway",
+      { parse_mode: "Markdown" }
+    );
+    console.warn("[auth:warning] Google token may be expired");
+  }
+}, { timezone: "Asia/Jerusalem" });
+
 // ── Bot handlers ──────────────────────────────────────────────────────────────
 
 bot.command("start", async (ctx) => {
@@ -350,7 +454,7 @@ bot.command("start", async (ctx) => {
   console.log("TELEGRAM_CHAT_ID =", ctx.chat.id);
   histories.delete(ctx.chat.id);
   return ctx.reply(
-    "היי! אני האסיסטנט האישי שלך 👋\n\nאני יכול לעזור עם:\n• 📅 יומן Google\n• 📧 Gmail\n• ✅ Apple Reminders\n• 🎙 הודעות קוליות\n\n⏰ אשלח לך בריף יומי ב-7:00 וסיכום ב-22:00 כל יום.\n\nשאל אותי כל דבר!"
+    "היי! אני האסיסטנט האישי שלך 👋\n\nאני יכול לעזור עם:\n• 📅 יומן Google\n• 📧 Gmail\n• ✅ Google Tasks\n• ⏰ תזכורות חכמות\n• 🎙 הודעות קוליות בעברית\n\n⏰ אשלח לך בריף יומי ב-7:00 וסיכום ב-22:00 כל יום.\n\nשאל אותי כל דבר!"
   );
 });
 
@@ -363,7 +467,10 @@ bot.command("brief", async (ctx) => {
   await ctx.replyWithChatAction("typing");
   const stopTyping = keepTyping(ctx);
   try {
-    const reply = await runAgent(ctx.chat.id, "תן לי בריף יומי קצר: יומן היום, תזכורות פתוחות, ומיילים דחופים.");
+    const reply = await runAgent(
+      ctx.chat.id,
+      "תן לי בריף יומי קצר: יומן היום, משימות פתוחות ב-Google Tasks, ומיילים דחופים."
+    );
     stopTyping();
     await ctx.reply(reply, { parse_mode: "Markdown" });
   } catch (err) {
@@ -372,11 +479,21 @@ bot.command("brief", async (ctx) => {
   }
 });
 
+bot.command("reminders", async (ctx) => {
+  const all = await loadReminders();
+  const mine = all.filter((r) => r.chatId === ctx.chat.id);
+  if (!mine.length) return ctx.reply("אין תזכורות ממתינות.");
+  const lines = mine.map((r) => {
+    const d = new Date(r.fireAt);
+    return `• ${r.text} — ${d.toLocaleString("he-IL", { timeZone: "Asia/Jerusalem" })}`;
+  });
+  return ctx.reply(`⏰ תזכורות ממתינות:\n\n${lines.join("\n")}`);
+});
+
 bot.command("debug_task", async (ctx) => {
   await ctx.replyWithChatAction("typing");
   try {
     console.log("[debug_task] Fetching task lists...");
-    const { getTaskLists } = await import("./google-tasks.js");
     const lists = await getTaskLists();
     console.log("[debug_task] Lists:", JSON.stringify(lists));
 
@@ -468,7 +585,35 @@ process.once("SIGTERM", () => bot.stop());
 // ── Start ─────────────────────────────────────────────────────────────────────
 
 console.log("🤖 Personal Assistant Telegram bot starting...");
-loadChatId().then(() => {
+loadChatId().then(async () => {
+  // Load and re-schedule any persisted reminders
+  const pending = await loadReminders();
+  let rescheduled = 0;
+  for (const r of pending) {
+    if (new Date(r.fireAt).getTime() > Date.now()) {
+      scheduleReminder(r);
+      rescheduled++;
+    } else {
+      // Past-due — fire immediately
+      fireReminder(r);
+    }
+  }
+  if (rescheduled > 0) console.log(`[reminders] Rescheduled ${rescheduled} pending reminder(s)`);
+
+  // Auth health check on startup
+  const authOk = await checkGoogleAuth();
+  if (!authOk) {
+    console.warn("[auth:startup] Google auth check FAILED — token may be expired");
+    if (registeredChatId) {
+      await bot.api.sendMessage(
+        registeredChatId,
+        "⚠️ Google Auth נכשל בסטארטאפ — הטוקן כנראה פג. צריך לחדש אותו ב-Railway."
+      ).catch(() => {});
+    }
+  } else {
+    console.log("[auth:startup] Google auth OK");
+  }
+
   bot.start({
     onStart: () => console.log("Bot is running. Send a message on Telegram!"),
   });
