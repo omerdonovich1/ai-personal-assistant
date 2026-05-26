@@ -372,6 +372,28 @@ bot.command("brief", async (ctx) => {
   }
 });
 
+bot.command("debug_task", async (ctx) => {
+  await ctx.replyWithChatAction("typing");
+  try {
+    console.log("[debug_task] Fetching task lists...");
+    const { getTaskLists } = await import("./google-tasks.js");
+    const lists = await getTaskLists();
+    console.log("[debug_task] Lists:", JSON.stringify(lists));
+
+    console.log("[debug_task] Adding test task...");
+    const task = await addTask("🔧 debug test task", undefined, undefined, "added by /debug_task");
+    console.log("[debug_task] Added:", JSON.stringify(task));
+
+    await ctx.reply(
+      `✅ Debug OK\n\nLists:\n${lists.map((l) => `• ${l.title} (${l.id})`).join("\n")}\n\nTask added:\n• ${task.title} → list: ${task.listTitle}`
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("[debug_task] ERROR:", msg);
+    await ctx.reply(`❌ Debug error: ${msg}`);
+  }
+});
+
 // ── Voice transcription ───────────────────────────────────────────────────────
 
 async function downloadTelegramFile(fileUrl: string, destPath: string): Promise<void> {
@@ -421,6 +443,7 @@ bot.on("message:voice", async (ctx) => {
 bot.on("message:text", async (ctx) => {
   const chatId = ctx.chat.id;
   const text = ctx.message.text;
+  console.log(`[msg] chatId=${chatId} text="${text.slice(0, 80)}"`);
 
   await ctx.replyWithChatAction("typing");
   const stopTyping = keepTyping(ctx);
