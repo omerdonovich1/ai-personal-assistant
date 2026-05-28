@@ -487,13 +487,23 @@ async function checkGoogleAuth(): Promise<boolean> {
 
 // ── Scheduled messages ────────────────────────────────────────────────────────
 
+async function safeSend(chatId: number, text: string): Promise<void> {
+  try {
+    await bot.api.sendMessage(chatId, text, { parse_mode: "Markdown" });
+  } catch {
+    // Fallback: plain text (handles unbalanced markdown characters)
+    await bot.api.sendMessage(chatId, text);
+  }
+}
+
 async function sendScheduled(prompt: string): Promise<void> {
   if (!registeredChatId) return;
   try {
     const reply = await runAgent(registeredChatId, prompt);
-    await bot.api.sendMessage(registeredChatId, reply, { parse_mode: "Markdown" });
+    await safeSend(registeredChatId, reply);
   } catch (err) {
     console.error("Scheduled message error:", err);
+    await bot.api.sendMessage(registeredChatId, `⚠️ שגיאה בבריף: ${err instanceof Error ? err.message : String(err)}`).catch(() => {});
   }
 }
 
@@ -558,7 +568,7 @@ bot.command("brief", async (ctx) => {
   try {
     const reply = await runAgent(ctx.chat.id, "תן לי בריף יומי קצר: מזג אוויר, יומן היום, משימות פתוחות, ומיילים דחופים.");
     stopTyping();
-    await ctx.reply(reply, { parse_mode: "Markdown" });
+    await safeSend(ctx.chat.id, reply);
   } catch (err) {
     stopTyping();
     await ctx.reply(`שגיאה: ${err instanceof Error ? err.message : String(err)}`);
@@ -625,7 +635,7 @@ bot.on("message:voice", async (ctx) => {
     if (!transcript) { stopTyping(); return ctx.reply("לא הצלחתי להבין את ההקלטה, נסה שוב."); }
     const reply = await runAgent(ctx.chat.id, transcript);
     stopTyping();
-    await ctx.reply(`🎙 _${transcript}_\n\n${reply}`, { parse_mode: "Markdown" });
+    await safeSend(ctx.chat.id, `🎙 _${transcript}_\n\n${reply}`);
   } catch (err) {
     stopTyping();
     await ctx.reply(`שגיאה בתמלול: ${err instanceof Error ? err.message : String(err)}`);
@@ -656,7 +666,7 @@ bot.on("message:photo", async (ctx) => {
 
     const reply = await runAgent(chatId, caption, [imageBlock]);
     stopTyping();
-    await ctx.reply(reply, { parse_mode: "Markdown" });
+    await safeSend(chatId, reply);
   } catch (err) {
     stopTyping();
     const msg = err instanceof Error ? err.message : String(err);
@@ -676,7 +686,7 @@ bot.on("message:text", async (ctx) => {
   try {
     const reply = await runAgent(chatId, text);
     stopTyping();
-    await ctx.reply(reply, { parse_mode: "Markdown" });
+    await safeSend(chatId, reply);
   } catch (err) {
     stopTyping();
     const msg = err instanceof Error ? err.message : String(err);
