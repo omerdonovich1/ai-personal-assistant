@@ -20,7 +20,7 @@ import { getCalendarEvents, quickAddCalendarEvent, addCalendarEvent } from "./go
 import { getUnreadEmails, sendEmail } from "./google-gmail.js";
 import { loadReminders, upsertReminder, deleteReminder, type Reminder } from "./reminder-store.js";
 import { loadUserFacts, upsertFact, deleteFact } from "./user-memory.js";
-import { webSearch, getWeather } from "./web-search.js";
+import { webSearch, getWeather, getExchangeRate } from "./web-search.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CHAT_ID_FILE = join(__dirname, "..", "data", "chat-id.json");
@@ -248,6 +248,18 @@ const TOOLS: Anthropic.Tool[] = [
     },
   },
   {
+    name: "get_exchange_rate",
+    description: "Get real-time currency exchange rate. Use for 'שער דולר', 'שער אירו', currency conversion questions.",
+    input_schema: {
+      type: "object",
+      properties: {
+        from: { type: "string", description: "Source currency code, e.g. 'USD', 'EUR', 'GBP'." },
+        to: { type: "string", description: "Target currency code, e.g. 'ILS', 'USD'. Default ILS." },
+      },
+      required: ["from"],
+    },
+  },
+  {
     name: "find_free_slots",
     description: "Find free time slots in the calendar for a given day. Use when user asks 'מתי יש לי זמן' or wants to schedule a meeting.",
     input_schema: {
@@ -325,6 +337,10 @@ async function executeTool(name: string, input: Record<string, unknown>, chatId:
         out = JSON.stringify(await webSearch(input.query as string), null, 2); break;
       case "get_weather":
         out = JSON.stringify(await getWeather(input.city as string | undefined), null, 2); break;
+      case "get_exchange_rate":
+        out = JSON.stringify(
+          await getExchangeRate(input.from as string, (input.to as string) ?? "ILS"), null, 2
+        ); break;
       case "find_free_slots":
         out = JSON.stringify(
           await findFreeSlots(input.date as string, input.durationMinutes as number), null, 2

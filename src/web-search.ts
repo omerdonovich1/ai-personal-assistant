@@ -1,4 +1,6 @@
-// ── Web Search (Brave Search API) ─────────────────────────────────────────────
+// ── Web Search ────────────────────────────────────────────────────────────────
+// Primary: DuckDuckGo Instant Answer API (free, no key needed)
+// Enhanced: Brave Search API (optional, better results when BRAVE_API_KEY is set)
 
 export interface SearchResult {
   title: string;
@@ -6,12 +8,50 @@ export interface SearchResult {
   description: string;
 }
 
-export async function webSearch(query: string, count = 5): Promise<SearchResult[]> {
-  const apiKey = process.env.BRAVE_API_KEY;
-  if (!apiKey) {
-    throw new Error("BRAVE_API_KEY not configured. Add it to Railway env vars (free at search.brave.com/app/keys).");
+async function duckDuckGoSearch(query: string, count = 5): Promise<SearchResult[]> {
+  const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
+  const res = await fetch(url, {
+    headers: { "User-Agent": "Mozilla/5.0 (compatible; PersonalAssistantBot/1.0)" },
+  });
+  if (!res.ok) throw new Error(`DuckDuckGo error: ${res.status}`);
+
+  const data = await res.json() as {
+    Answer?: string;
+    AbstractText?: string;
+    AbstractURL?: string;
+    Heading?: string;
+    RelatedTopics?: Array<{ Text?: string; FirstURL?: string; Topics?: Array<{ Text?: string; FirstURL?: string }> }>;
+  };
+
+  const results: SearchResult[] = [];
+
+  // Instant answer (e.g. currency rates, calculations)
+  if (data.Answer) {
+    results.push({ title: "תשובה מיידית", url: data.AbstractURL ?? "", description: data.Answer });
+  }
+  // Abstract (Wikipedia-style summary)
+  if (data.AbstractText) {
+    results.push({ title: data.Heading ?? query, url: data.AbstractURL ?? "", description: data.AbstractText });
+  }
+  // Related topics
+  for (const topic of data.RelatedTopics ?? []) {
+    if (results.length >= count) break;
+    if (topic.Text && topic.FirstURL) {
+      results.push({ title: topic.Text.slice(0, 120), url: topic.FirstURL, description: topic.Text });
+    }
+    // Nested topics
+    for (const sub of topic.Topics ?? []) {
+      if (results.length >= count) break;
+      if (sub.Text && sub.FirstURL) {
+        results.push({ title: sub.Text.slice(0, 120), url: sub.FirstURL, description: sub.Text });
+      }
+    }
   }
 
+  return results.slice(0, count);
+}
+
+async function braveSearch(query: string, count: number, apiKey: string): Promise<SearchResult[]> {
   const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=${count}&search_lang=he&country=IL`;
   const res = await fetch(url, {
     headers: {
@@ -20,17 +60,44 @@ export async function webSearch(query: string, count = 5): Promise<SearchResult[
       "X-Subscription-Token": apiKey,
     },
   });
-
   if (!res.ok) throw new Error(`Brave Search error: ${res.status} ${res.statusText}`);
   const data = await res.json() as {
     web?: { results?: Array<{ title?: string; url?: string; description?: string }> };
   };
-
   return (data.web?.results ?? []).slice(0, count).map((r) => ({
     title: r.title ?? "",
     url: r.url ?? "",
     description: r.description ?? "",
   }));
+}
+
+export async function webSearch(query: string, count = 5): Promise<SearchResult[]> {
+  const apiKey = process.env.BRAVE_API_KEY;
+
+  // Try Brave first if key is configured
+  if (apiKey) {
+    try {
+      return await braveSearch(query, count, apiKey);
+    } catch (err) {
+      console.warn("[search] Brave API failed, falling back to DuckDuckGo:", (err as Error).message);
+    }
+  }
+
+  // Fallback: DuckDuckGo (always available, no key needed)
+  return duckDuckGoSearch(query, count);
+}
+
+// ── Exchange rates (free, no key) ─────────────────────────────────────────────
+
+export async function getExchangeRate(from: string, to: string): Promise<{ rate: number; from: string; to: string }> {
+  const url = `https://open.er-api.com/v6/latest/${from.toUpperCase()}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Exchange rate API error: ${res.status}`);
+  const data = await res.json() as { rates: Record<string, number>; result: string };
+  if (data.result !== "success") throw new Error("Exchange rate fetch failed");
+  const rate = data.rates[to.toUpperCase()];
+  if (!rate) throw new Error(`Currency ${to} not found`);
+  return { rate: Math.round(rate * 1000) / 1000, from: from.toUpperCase(), to: to.toUpperCase() };
 }
 
 // ── Weather (Open-Meteo — free, no API key) ───────────────────────────────────
