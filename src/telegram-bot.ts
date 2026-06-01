@@ -21,6 +21,7 @@ import { getUnreadEmails, sendEmail } from "./google-gmail.js";
 import { loadReminders, upsertReminder, deleteReminder, type Reminder } from "./reminder-store.js";
 import { loadUserFacts, upsertFact, deleteFact } from "./user-memory.js";
 import { webSearch, getWeather, getExchangeRate } from "./web-search.js";
+import { CONTEXTS, getActiveContext, setActiveContext, resolveContext } from "./context-store.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CHAT_ID_FILE = join(__dirname, "..", "data", "chat-id.json");
@@ -211,12 +212,13 @@ const TOOLS: Anthropic.Tool[] = [
   },
   {
     name: "remember_fact",
-    description: "Save a fact about the user for future sessions. Call when user shares personal info worth remembering (name, contact, preference, etc.).",
+    description: "Save a fact about the user for future sessions. Call when user shares personal info worth remembering (contact, price, process, preference). Tag with context when relevant.",
     input_schema: {
       type: "object",
       properties: {
-        key: { type: "string", description: "Short label, e.g. 'wife_name', 'accountant_phone', 'doctor_name'." },
+        key: { type: "string", description: "Short label, e.g. 'supplier_phone', 'price_per_unit', 'manager_name'." },
         value: { type: "string", description: "The value to remember." },
+        context: { type: "string", description: "Context key: 'dynamika', 'spinz', 'sunshine', 'jewelry', 'home', or omit for global." },
       },
       required: ["key", "value"],
     },
@@ -327,9 +329,11 @@ async function executeTool(name: string, input: Record<string, unknown>, chatId:
         await deleteReminder(input.id as string);
         out = JSON.stringify({ ok: true }); break;
       }
-      case "remember_fact":
-        await upsertFact(input.key as string, input.value as string);
-        out = JSON.stringify({ ok: true, key: input.key, value: input.value }); break;
+      case "remember_fact": {
+        const factCtx = (input.context as string | undefined) ?? null;
+        await upsertFact(input.key as string, input.value as string, factCtx);
+        out = JSON.stringify({ ok: true, key: input.key, value: input.value, context: factCtx }); break;
+      }
       case "forget_fact":
         await deleteFact(input.key as string);
         out = JSON.stringify({ ok: true }); break;
@@ -375,10 +379,21 @@ async function runAgent(chatId: number, userText: string, extraContent?: Anthrop
   const israelTimeStr = israelNow.toISOString().replace("Z", "+03:00");
   const israelDateStr = israelTimeStr.slice(0, 10);
 
-  // Load user memory facts and inject into system prompt
-  const facts = await loadUserFacts();
+  // Load active context
+  const activeCtx = await getActiveContext();
+
+  // Load user memory facts (global + context-specific)
+  const facts = await loadUserFacts(activeCtx?.key ?? null);
   const factsSection = facts.length > 0
-    ? `\n\n## מה שאני יודע עליך:\n${facts.map((f) => `- ${f.key}: ${f.value}`).join("\n")}`
+    ? `\n\n## מה שאני יודע עליך${activeCtx ? ` (${activeCtx.name})` : ""}:\n${facts.map((f) => `- ${f.key}: ${f.value}`).join("\n")}`
+    : "";
+
+  // Context section
+  const contextSection = activeCtx
+    ? `\n\n## קונטקסט פעיל: ${activeCtx.emoji} ${activeCtx.name}
+- כל המשימות שתוסיף ילכו לרשימה "${activeCtx.taskList}" אלא אם המשתמש מציין אחרת.
+- כשאתה מציג בריף — התמקד ב-${activeCtx.name}: משימות מרשימת "${activeCtx.taskList}", אירועים רלוונטיים, ופרטים ספציפיים לנושא זה.
+- שמור מידע חדש שהמשתמש מספר עם context="${activeCtx.key}" (אנשי קשר, פרטים, תהליכים ספציפיים ל-${activeCtx.name}).`
     : "";
 
   const SYSTEM = `You are a personal AI assistant. You have access to Google Calendar, Gmail, Google Tasks, reminders, web search, weather, and smart scheduling.
@@ -388,12 +403,13 @@ NEVER confirm an action without first calling the appropriate tool. Tool call MU
 
 Current Israel date/time: ${israelTimeStr}
 IMPORTANT: All times are in Israel time (UTC+3). Always include +03:00 suffix in ISO 8601 strings.
-Example: 17:20 today → ${israelDateStr}T17:20:00+03:00${factsSection}
+Example: 17:20 today → ${israelDateStr}T17:20:00+03:00${contextSection}${factsSection}
 
 ## Adding tasks:
 - ALWAYS call add_task FIRST, then confirm. Never say "נוסף" without calling the tool.
+- Default listName: "${activeCtx?.taskList ?? ""}" (active context). Only override if user explicitly says a different list.
 - "בבוקר"=08:00, "בצהריים"=12:00, "אחה\"צ"=15:00, "בערב"=18:00, "בלילה"=21:00. No time → 09:00.
-- After: ✅ נוסף: "<title>"
+- After: ✅ נוסף: "<title>"${activeCtx ? ` ל-${activeCtx.name}` : ""}
 
 ## Reminders:
 - ALWAYS call set_reminder FIRST when user says "תזכיר לי" or "remind me".
@@ -407,16 +423,16 @@ Example: 17:20 today → ${israelDateStr}T17:20:00+03:00${factsSection}
 - After: ✅ נוסף ליומן: "<title>"
 
 ## User memory:
-- When the user shares personal info (name of a contact, preference, phone number, etc.), proactively call remember_fact.
-- Use the stored facts naturally in responses without mentioning you're "looking them up".
+- When the user shares personal info relevant to the current context (contacts, prices, processes, preferences), call remember_fact with context="${activeCtx?.key ?? "global"}".
+- Use stored facts naturally without saying you're "looking them up".
 
 ## Web search:
-- Use web_search for real-time questions: current prices, news, exchange rates, today's events.
-- Use get_weather for weather questions (default: Tel Aviv).
+- Use web_search for real-time questions: prices, news, exchange rates.
+- Use get_weather for weather. Use get_exchange_rate for currency rates.
 
 ## Smart scheduling:
-- Use find_free_slots when user asks "מתי אני פנוי" or wants to find a meeting slot.
-- Present results in natural language: "יש לך חלון ב-10:00–12:00 וב-15:00–17:00"
+- Use find_free_slots when user asks "מתי אני פנוי" or wants a meeting slot.
+- Present in natural language: "יש לך חלון ב-10:00–12:00 וב-15:00–17:00"
 
 ## Sending emails:
 - FIRST draft and show the email, ask "האם לשלוח?". Do NOT call send_email yet.
@@ -424,7 +440,7 @@ Example: 17:20 today → ${israelDateStr}T17:20:00+03:00${factsSection}
 - After: ✅ המייל נשלח!
 
 ## Analyzing images:
-- When the user sends an image, describe what you see and extract any actionable info (dates, amounts, tasks, etc.).
+- Describe what you see and extract actionable info (dates, amounts, tasks).
 - Proactively offer to add calendar events, tasks, or reminders based on the image content.`;
 
   // Build the user message content
@@ -563,11 +579,62 @@ bot.command("clear", (ctx) => {
   return ctx.reply("השיחה נוקתה ✅");
 });
 
+bot.command("ctx", async (ctx) => {
+  const arg = ctx.match?.trim();
+
+  if (!arg) {
+    // Show current context + all available
+    const active = await getActiveContext();
+    const list = Object.values(CONTEXTS)
+      .map((c) => `${c.emoji} /ctx ${c.key} — ${c.name}`)
+      .join("\n");
+    const current = active
+      ? `קונטקסט פעיל: ${active.emoji} *${active.name}*`
+      : "אין קונטקסט פעיל (כללי)";
+    return ctx.reply(
+      `${current}\n\n*קונטקסטים זמינים:*\n${list}\n\n/ctx off — חזרה לכללי`,
+      { parse_mode: "Markdown" }
+    );
+  }
+
+  if (arg === "off" || arg === "כללי") {
+    await setActiveContext(null);
+    histories.delete(ctx.chat.id);
+    return ctx.reply("✅ חזרת למצב כללי. השיחה נוקתה.");
+  }
+
+  const resolved = resolveContext(arg);
+  if (!resolved) {
+    return ctx.reply(`לא מצאתי קונטקסט בשם "${arg}". נסה: ${Object.keys(CONTEXTS).join(", ")}`);
+  }
+
+  await setActiveContext(resolved.key);
+  histories.delete(ctx.chat.id); // Clear history on context switch
+  return ctx.reply(
+    `${resolved.emoji} *${resolved.name}* — קונטקסט פעיל!\n\nהשיחה נוקתה. מעכשיו:\n• משימות ילכו לרשימת "${resolved.taskList}"\n• הזיכרון מסונן לנושא זה\n\nשאל אותי כל דבר על ${resolved.name}`,
+    { parse_mode: "Markdown" }
+  );
+});
+
 bot.command("memory", async (ctx) => {
-  const facts = await loadUserFacts();
+  const active = await getActiveContext();
+  const facts = await loadUserFacts(active?.key ?? undefined);
   if (!facts.length) return ctx.reply("אין שום דבר שמור בזיכרון עדיין.");
-  const lines = facts.map((f) => `• *${f.key}*: ${f.value}`).join("\n");
-  return ctx.reply(`🧠 *מה שאני זוכר עליך:*\n\n${lines}`, { parse_mode: "Markdown" });
+
+  // Group by context
+  const global = facts.filter((f) => !f.context);
+  const contextual = facts.filter((f) => f.context);
+
+  const lines: string[] = [];
+  if (active) lines.push(`${active.emoji} *${active.name}:*`);
+  contextual.forEach((f) => lines.push(`  • *${f.key}*: ${f.value}`));
+  if (global.length) {
+    if (contextual.length) lines.push("");
+    lines.push("🌐 *כללי:*");
+    global.forEach((f) => lines.push(`  • *${f.key}*: ${f.value}`));
+  }
+
+  return ctx.reply(`🧠 *זיכרון:*\n\n${lines.join("\n")}`, { parse_mode: "Markdown" });
 });
 
 bot.command("reminders", async (ctx) => {

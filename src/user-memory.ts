@@ -11,29 +11,48 @@ const FILE = join(DATA_DIR, "user-memory.json");
 export interface MemoryFact {
   key: string;
   value: string;
+  context: string | null; // null = global
   updatedAt: string;
 }
 
-export async function loadUserFacts(): Promise<MemoryFact[]> {
+export async function loadUserFacts(context?: string | null): Promise<MemoryFact[]> {
   try {
-    return JSON.parse(await readFile(FILE, "utf-8")) as MemoryFact[];
+    const all = JSON.parse(await readFile(FILE, "utf-8")) as MemoryFact[];
+    if (context === undefined) return all; // return everything
+    // Return global facts + facts for this specific context
+    return all.filter((f) => f.context === null || f.context === context);
   } catch {
     return [];
   }
 }
 
-export async function upsertFact(key: string, value: string): Promise<void> {
-  const facts = await loadUserFacts();
-  const idx = facts.findIndex((f) => f.key.toLowerCase() === key.toLowerCase());
-  const entry: MemoryFact = { key, value, updatedAt: new Date().toISOString() };
-  if (idx >= 0) facts[idx] = entry;
-  else facts.push(entry);
+export async function upsertFact(key: string, value: string, context: string | null = null): Promise<void> {
+  let all: MemoryFact[] = [];
+  try {
+    all = JSON.parse(await readFile(FILE, "utf-8")) as MemoryFact[];
+  } catch { /* file doesn't exist yet */ }
+
+  const idx = all.findIndex(
+    (f) => f.key.toLowerCase() === key.toLowerCase() && f.context === context
+  );
+  const entry: MemoryFact = { key, value, context, updatedAt: new Date().toISOString() };
+  if (idx >= 0) all[idx] = entry;
+  else all.push(entry);
+
   mkdirSync(DATA_DIR, { recursive: true });
-  await writeFile(FILE, JSON.stringify(facts, null, 2));
+  await writeFile(FILE, JSON.stringify(all, null, 2));
 }
 
-export async function deleteFact(key: string): Promise<void> {
-  const facts = await loadUserFacts();
+export async function deleteFact(key: string, context?: string | null): Promise<void> {
+  let all: MemoryFact[] = [];
+  try {
+    all = JSON.parse(await readFile(FILE, "utf-8")) as MemoryFact[];
+  } catch { return; }
+
+  const filtered = context !== undefined
+    ? all.filter((f) => !(f.key.toLowerCase() === key.toLowerCase() && f.context === context))
+    : all.filter((f) => f.key.toLowerCase() !== key.toLowerCase());
+
   mkdirSync(DATA_DIR, { recursive: true });
-  await writeFile(FILE, JSON.stringify(facts.filter((f) => f.key.toLowerCase() !== key.toLowerCase()), null, 2));
+  await writeFile(FILE, JSON.stringify(filtered, null, 2));
 }
