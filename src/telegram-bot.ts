@@ -405,9 +405,18 @@ Current Israel date/time: ${israelTimeStr}
 IMPORTANT: All times are in Israel time (UTC+3). Always include +03:00 suffix in ISO 8601 strings.
 Example: 17:20 today → ${israelDateStr}T17:20:00+03:00${contextSection}${factsSection}
 
+## Context auto-detection — CRITICAL:
+Always scan the message for context keywords and route accordingly, even if no active context is set:
+- "דינמיקה" / "dynamika" → listName="דינמיקה", memory context="dynamika"
+- "spinz" / "ספינז" / "אופניים" / "האופניים" → listName="Spinz", memory context="spinz"
+- "סולשיין" / "sunshine" / "עומר וירין" / "סולשיין האוס" → listName="סולשיין", memory context="sunshine"
+- "תכשיטים" / "jewelry" → listName="תכשיטים", memory context="jewelry"
+- "חיי בית" / "הבית" / "ביתי" → listName="חיי בית", memory context="home"
+If no context keyword found → use active context default: "${activeCtx?.taskList ?? "first list"}"
+
 ## Adding tasks:
 - ALWAYS call add_task FIRST, then confirm. Never say "נוסף" without calling the tool.
-- Default listName: "${activeCtx?.taskList ?? ""}" (active context). Only override if user explicitly says a different list.
+- Detect listName from message context keywords (above). Default: "${activeCtx?.taskList ?? ""}".
 - "בבוקר"=08:00, "בצהריים"=12:00, "אחה\"צ"=15:00, "בערב"=18:00, "בלילה"=21:00. No time → 09:00.
 - After: ✅ נוסף: "<title>"${activeCtx ? ` ל-${activeCtx.name}` : ""}
 
