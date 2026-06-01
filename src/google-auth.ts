@@ -133,10 +133,10 @@ function captureCodeViaLocalServer(
       }
     });
 
-    // port 0 = OS picks any free port
-    // Capture the port in the listen callback so it's available in the request handler closure
+    // Use fixed port 3000 so it matches the registered redirect URI in Google Cloud Console
+    const FIXED_PORT = 3000;
     let boundPort: number;
-    server.listen(0, () => {
+    server.listen(FIXED_PORT, () => {
       boundPort = (server.address() as AddressInfo).port;
       const redirectUri = `http://localhost:${boundPort}`;
 
