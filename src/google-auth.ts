@@ -28,13 +28,16 @@ interface InstalledCredentials {
 let _cachedClient: OAuth2Client | null = null;
 
 async function bootstrapFromEnv(): Promise<void> {
+  // Always overwrite from env vars — env is the source of truth on Railway.
+  // Never skip the write: an old cached file would keep an expired token alive.
   const credEnv = process.env.GOOGLE_CREDENTIALS_JSON;
   if (credEnv) {
-    try { await readFile(CREDENTIALS_PATH, "utf-8"); } catch { await writeFile(CREDENTIALS_PATH, credEnv); }
+    await writeFile(CREDENTIALS_PATH, credEnv);
   }
   const tokenEnv = process.env.GOOGLE_TOKEN_JSON;
   if (tokenEnv) {
-    try { await readFile(TOKEN_PATH, "utf-8"); } catch { await writeFile(TOKEN_PATH, tokenEnv); }
+    await writeFile(TOKEN_PATH, tokenEnv);
+    _cachedClient = null; // force re-init with the fresh token
   }
 }
 
