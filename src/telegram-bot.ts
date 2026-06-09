@@ -241,7 +241,7 @@ const TOOLS: Anthropic.Tool[] = [
   },
   {
     name: "get_weather",
-    description: "Get current weather and 2-day forecast. Default city is Beit Herut (בית הרות). Pass city name only if user specifies a different location.",
+    description: "Get current weather and 2-day forecast. Default city is Beit Herut (בית חרות). Pass city name only if user specifies a different location.",
     input_schema: {
       type: "object",
       properties: {
@@ -410,7 +410,7 @@ async function runAgent(chatId: number, userText: string, extraContent?: Anthrop
 
   const SYSTEM = `You are an elite Executive AI Assistant. Reply ONLY in Hebrew. Sharp, minimal, zero fluff.
 Now: ${israelTimeStr} (UTC+3). All ISO datetimes MUST use +03:00. Today: ${israelDateStr}.
-Default location: בית הרות, ישראל (Beit Herut).
+Default location: בית חרות, ישראל (Beit Herut).
 
 IRON RULES:
 1. NEVER confirm any action without calling the tool first. Tool → then report.
@@ -552,7 +552,7 @@ async function sendScheduled(prompt: string): Promise<void> {
 // 07:00 — morning brief (weather + calendar + tasks + emails + time-blocking suggestions)
 cron.schedule("0 7 * * *", () => {
   sendScheduled(
-    "בריף בוקר — תשתמש בכלים במקביל:\n1. מזג אוויר (בית הרות)\n2. אירועי יומן להיום\n3. משימות פתוחות מכל הרשימות\n4. מיילים לא נקראים דחופים\n5. אם יש משימות פתוחות וחלונות פנויים — הצע time-blocking ספציפי.\nפורמט: כותרות קצרות, ללא נארציה."
+    "בריף בוקר — תשתמש בכלים במקביל:\n1. מזג אוויר (בית חרות)\n2. אירועי יומן להיום\n3. משימות פתוחות מכל הרשימות\n4. מיילים לא נקראים דחופים\n5. אם יש משימות פתוחות וחלונות פנויים — הצע time-blocking ספציפי.\nפורמט: כותרות קצרות, ללא נארציה."
   );
 }, { timezone: "Asia/Jerusalem" });
 
@@ -664,7 +664,7 @@ bot.command("brief", async (ctx) => {
   try {
     const reply = await runAgent(
       ctx.chat.id,
-      "בריף מיידי — הרץ כלים במקביל: מזג אוויר (בית הרות), יומן היום, משימות פתוחות, מיילים לא נקראים. אם יש משימות ויש חלונות פנויים — הצע time-blocking. ללא נארציה."
+      "בריף מיידי — הרץ כלים במקביל: מזג אוויר (בית חרות), יומן היום, משימות פתוחות, מיילים לא נקראים. אם יש משימות ויש חלונות פנויים — הצע time-blocking. ללא נארציה."
     );
     stopTyping();
     await safeSend(ctx.chat.id, reply);
