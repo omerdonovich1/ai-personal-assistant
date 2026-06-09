@@ -136,8 +136,8 @@ function captureCodeViaLocalServer(
       }
     });
 
-    // Use fixed port 3000 so it matches the registered redirect URI in Google Cloud Console
-    const FIXED_PORT = 3000;
+    // Use fixed port 3001 so it matches the registered redirect URI in Google Cloud Console
+    const FIXED_PORT = 3001;
     let boundPort: number;
     server.listen(FIXED_PORT, () => {
       boundPort = (server.address() as AddressInfo).port;
