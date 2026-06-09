@@ -125,9 +125,11 @@ const CITIES: Record<string, { lat: number; lon: number; name: string }> = {
   "נתניה": { lat: 32.3215, lon: 34.8532, name: "נתניה" },
   "פתח תקווה": { lat: 32.0878, lon: 34.8878, name: "פתח תקווה" },
   "ראשון לציון": { lat: 31.9730, lon: 34.7925, name: "ראשון לציון" },
+  "בית הרות": { lat: 32.3667, lon: 34.8833, name: "בית הרות" },
+  "beit herut": { lat: 32.3667, lon: 34.8833, name: "בית הרות" },
 };
 
-const DEFAULT_CITY = CITIES["תל אביב"];
+const DEFAULT_CITY = CITIES["בית הרות"];
 
 export interface WeatherForecast {
   city: string;

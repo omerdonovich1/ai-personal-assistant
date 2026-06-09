@@ -241,11 +241,11 @@ const TOOLS: Anthropic.Tool[] = [
   },
   {
     name: "get_weather",
-    description: "Get current weather and 2-day forecast. Default city is Tel Aviv.",
+    description: "Get current weather and 2-day forecast. Default city is Beit Herut (בית הרות). Pass city name only if user specifies a different location.",
     input_schema: {
       type: "object",
       properties: {
-        city: { type: "string", description: "City name in Hebrew or English. Optional." },
+        city: { type: "string", description: "City name in Hebrew or English. Optional — omit to use default (Beit Herut)." },
       },
     },
   },
@@ -309,10 +309,22 @@ async function executeTool(name: string, input: Record<string, unknown>, chatId:
         out = JSON.stringify(await quickAddCalendarEvent(input.text as string), null, 2); break;
       case "get_unread_emails":
         out = JSON.stringify(await getUnreadEmails((input.maxResults as number) ?? 5), null, 2); break;
-      case "send_email":
-        out = JSON.stringify(
-          await sendEmail(input.to as string, input.subject as string, input.body as string), null, 2
-        ); break;
+      case "send_email": {
+        const emailResult = await sendEmail(input.to as string, input.subject as string, input.body as string);
+        // Proactive: auto-schedule 48h follow-up reminder (silent, per goal directive)
+        const followUpAt = new Date(Date.now() + 48 * 60 * 60 * 1000);
+        const followUpId = `followup_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`;
+        const followUpReminder: Reminder = {
+          id: followUpId,
+          chatId,
+          text: `מעקב: טרם התקבלה תגובה למייל שנשלח אל ${input.to as string} — "${input.subject as string}"`,
+          fireAt: followUpAt.toISOString(),
+        };
+        await upsertReminder(followUpReminder);
+        scheduleReminder(followUpReminder);
+        out = JSON.stringify({ ...emailResult, followUpScheduled: followUpAt.toLocaleString("he-IL", { timeZone: "Asia/Jerusalem" }) });
+        break;
+      }
       case "set_reminder": {
         const id = `r_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
         const reminder: Reminder = { id, chatId, text: input.text as string, fireAt: input.fireAt as string };
@@ -396,37 +408,50 @@ async function runAgent(chatId: number, userText: string, extraContent?: Anthrop
 - שמור מידע חדש שהמשתמש מספר עם context="${activeCtx.key}" (אנשי קשר, פרטים, תהליכים ספציפיים ל-${activeCtx.name}).`
     : "";
 
-  const SYSTEM = `You are a personal AI assistant (Hebrew/English). Reply in the user's language. Be concise.
-Now: ${israelTimeStr} (UTC+3). All ISO strings MUST use +03:00 suffix. Today: ${israelDateStr}.
-NEVER confirm an action without calling the tool first. CALL THE TOOL, then confirm.${contextSection}${factsSection}
+  const SYSTEM = `You are an elite Executive AI Assistant. Reply ONLY in Hebrew. Sharp, minimal, zero fluff.
+Now: ${israelTimeStr} (UTC+3). All ISO datetimes MUST use +03:00. Today: ${israelDateStr}.
+Default location: בית הרות, ישראל (Beit Herut).
 
-## Context keywords → listName:
-- דינמיקה/dynamika → "דינמיקה" | spinz/ספינז/אופניים → "Spinz" | סולשיין/sunshine → "סולשיין"
-- תכשיטים/jewelry → "תכשיטים" | חיי בית/הבית → "חיי בית"
-- No keyword → default list: "${activeCtx?.taskList ?? "My Tasks"}"
+IRON RULES:
+1. NEVER confirm any action without calling the tool first. Tool → then report.
+2. Silent execution — no narration, no "בודק...", "מוסיף...", just do it and report the result.
+3. Never ask for clarification on domain/context — infer from keywords and route silently.${contextSection}${factsSection}
 
-## Tasks — CALL add_task IMMEDIATELY, no confirmation first:
-- listName from keywords above. Default: "${activeCtx?.taskList ?? "My Tasks"}".
-- בבוקר=08:00 בצהריים=12:00 אחה"צ=15:00 בערב=18:00 בלילה=21:00 no time→09:00
-- Reply: ✅ נוסף: "<title>"
+## DOMAIN ROUTING — auto-detect, no clarification:
+- 🚴 SPINZ: אופניים/bicycles, שלדה/frame, single-speed/fixed, ספקי סין/Guangzhou → list "Spinz"
+- 💍 תכשיטים/Onde: Shopify, jewelry, dropshipping, e-commerce, צילום מוצר → list "תכשיטים"
+- 💼 Tech/דינמיקה: software, Carman S, Next.js, TypeScript, MCP, QC, UI/UX, fleet mgmt → list "דינמיקה"
+- 🏡 חיי בית: Jack Russell, Kia Picanto, Ninja Grill, בישול/cooking, fitness, personal → list "חיי בית"
+- 🏠 סולשיין: עומר/וירין/Sunshine/סולשיין → list "סולשיין"
+- No keyword → list: "${activeCtx?.taskList ?? "My Tasks"}"
 
-## Reminders — CALL set_reminder IMMEDIATELY when user says תזכיר לי / remind me:
-- בעוד שעה=now+1h | בשעה X=today X | מחר=tomorrow
+## PROACTIVE BEHAVIORS (run silently, no announcement):
+- After send_email → follow-up reminder is auto-set for 48h (already handled by system)
+- After add_task → if today has free time blocks, proactively suggest scheduling it (use find_free_slots)
+- When user mentions names/contacts/prices/phones → call remember_fact immediately with context
+
+## TASKS — add_task IMMEDIATELY:
+- בבוקר=08:00 | בצהריים=12:00 | אחה"צ=15:00 | בערב=18:00 | בלילה=21:00 | no time→09:00
+- Reply: ✅ נוסף: "<title>" → <listName>
+
+## REMINDERS — set_reminder IMMEDIATELY:
+- בעוד שעה=now+1h | בשעה X=today X | מחר X=tomorrow X
 - Reply: ✅ תזכורת: "<text>" ב-<time>
 
-## Calendar — use add_calendar_event for Hebrew, quick_add for English only:
-- כל שבוע ביום X → RRULE:FREQ=WEEKLY;BYDAY=<day> | כל יום → RRULE:FREQ=DAILY
-- No end time → 1h after start. Reply: ✅ ביומן: "<title>"
+## CALENDAR — add_calendar_event (Hebrew), quick_add (English only):
+- כל שבוע ביום X → RRULE:FREQ=WEEKLY;BYDAY=XX | No end→+1h
+- Reply: ✅ ביומן: "<title>"
 
-## Email — draft first, show user, ask "האם לשלוח?". Call send_email ONLY after yes.
+## EMAIL — DRAFT first, show user, ask "לשלוח? ✅/❌". Call send_email ONLY after explicit yes.
 
-## Memory — call remember_fact when user shares contacts/prices/info. Use stored facts naturally.
+## COMPLEX INPUT — chain of actions:
+Extract ALL entities (dates, amounts, names, tasks) → run tools in parallel → single combined report.
 
-## Search — web_search for news/prices, get_weather for weather, get_exchange_rate for currency.
+## MEMORY — remember_fact for any contact/price/preference/process. Use stored facts naturally.
 
-## Scheduling — find_free_slots for "מתי אני פנוי". Reply: "יש לך חלון ב-10:00–12:00"
-
-## Images — describe, extract tasks/dates, offer to add to calendar/tasks.`;
+## SEARCH/WEATHER/RATES — web_search / get_weather / get_exchange_rate as needed.
+## SCHEDULING — find_free_slots → suggest time-blocking for open tasks.
+## IMAGES — extract entities → execute tools in parallel → report.`;
 
   // Build the user message content
   const userContent: Anthropic.ContentBlockParam[] = extraContent
@@ -439,7 +464,7 @@ NEVER confirm an action without calling the tool first. CALL THE TOOL, then conf
   while (true) {
     const response = await anthropic.messages.create({
       model: "claude-haiku-4-5",
-      max_tokens: 1024,
+      max_tokens: 2048,
       system: SYSTEM,
       tools: TOOLS,
       messages,
@@ -524,16 +549,18 @@ async function sendScheduled(prompt: string): Promise<void> {
   }
 }
 
-// 07:00 — morning brief (calendar + tasks + weather + urgent emails)
+// 07:00 — morning brief (weather + calendar + tasks + emails + time-blocking suggestions)
 cron.schedule("0 7 * * *", () => {
   sendScheduled(
-    "בוקר טוב! תן לי בריף יומי קצר ומסודר:\n1. מזג האוויר היום (תל אביב)\n2. מה יש לי ביומן היום\n3. משימות פתוחות ב-Google Tasks\n4. מיילים דחופים שצריך לדעת עליהם\nקצר וענייני."
+    "בריף בוקר — תשתמש בכלים במקביל:\n1. מזג אוויר (בית הרות)\n2. אירועי יומן להיום\n3. משימות פתוחות מכל הרשימות\n4. מיילים לא נקראים דחופים\n5. אם יש משימות פתוחות וחלונות פנויים — הצע time-blocking ספציפי.\nפורמט: כותרות קצרות, ללא נארציה."
   );
 }, { timezone: "Asia/Jerusalem" });
 
 // 22:00 — evening summary
 cron.schedule("0 22 * * *", () => {
-  sendScheduled("ערב טוב! תן לי סיכום יום קצר: מה היה מתוכנן היום, ומה מתוכנן מחר. קצר ולעניין.");
+  sendScheduled(
+    "סיכום ערב — תשתמש בכלים במקביל:\n1. מה הושלם היום (אירועי יומן)\n2. משימות שנותרו פתוחות\n3. מה מתוכנן מחר\nקצר, ממוקד, ללא נארציה."
+  );
 }, { timezone: "Asia/Jerusalem" });
 
 // Every Sunday 09:00 — auth health check
@@ -555,7 +582,8 @@ bot.command("start", async (ctx) => {
   console.log("TELEGRAM_CHAT_ID =", ctx.chat.id);
   histories.delete(ctx.chat.id);
   return ctx.reply(
-    "היי! אני האסיסטנט האישי שלך 👋\n\nאני יכול לעזור עם:\n• 📅 יומן Google\n• 📧 Gmail\n• ✅ Google Tasks\n• ⏰ תזכורות חכמות\n• 🧠 זיכרון אישי\n• 🔍 חיפוש ברשת ומזג אוויר\n• 📸 ניתוח תמונות\n• 🗓 תזמון חכם\n• 🎙 הודעות קוליות בעברית\n\nשאל אותי כל דבר!"
+    "מוכן לפעולה.\n\n*תחומים:* 🚴 SPINZ | 💍 תכשיטים | 💼 דינמיקה | 🏡 בית | 🏠 סולשיין\n*כלים:* יומן · Gmail · Tasks · תזכורות · זיכרון · חיפוש · מזג אוויר · תמונות · קול\n\n_בריף יומי: 07:00 | סיכום ערב: 22:00_",
+    { parse_mode: "Markdown" }
   );
 });
 
@@ -634,7 +662,10 @@ bot.command("brief", async (ctx) => {
   await ctx.replyWithChatAction("typing");
   const stopTyping = keepTyping(ctx);
   try {
-    const reply = await runAgent(ctx.chat.id, "תן לי בריף יומי קצר: מזג אוויר, יומן היום, משימות פתוחות, ומיילים דחופים.");
+    const reply = await runAgent(
+      ctx.chat.id,
+      "בריף מיידי — הרץ כלים במקביל: מזג אוויר (בית הרות), יומן היום, משימות פתוחות, מיילים לא נקראים. אם יש משימות ויש חלונות פנויים — הצע time-blocking. ללא נארציה."
+    );
     stopTyping();
     await safeSend(ctx.chat.id, reply);
   } catch (err) {
