@@ -124,7 +124,7 @@ const TOOLS: Anthropic.Tool[] = [
   },
   {
     name: "add_task",
-    description: "Create a new task in Google Tasks. Call this IMMEDIATELY — NEVER confirm without calling first.",
+    description: "CALL THIS TOOL IMMEDIATELY when user wants to add a task. DO NOT say 'נוסף' or 'added' without calling this first. No exceptions.",
     input_schema: {
       type: "object",
       properties: {
@@ -190,7 +190,7 @@ const TOOLS: Anthropic.Tool[] = [
   },
   {
     name: "set_reminder",
-    description: "Set a Telegram push reminder. Call IMMEDIATELY when user says 'תזכיר לי' or 'remind me'.",
+    description: "CALL THIS TOOL IMMEDIATELY when user says 'תזכיר לי' or 'remind me'. DO NOT confirm without calling first.",
     input_schema: {
       type: "object",
       properties: {
@@ -396,61 +396,37 @@ async function runAgent(chatId: number, userText: string, extraContent?: Anthrop
 - שמור מידע חדש שהמשתמש מספר עם context="${activeCtx.key}" (אנשי קשר, פרטים, תהליכים ספציפיים ל-${activeCtx.name}).`
     : "";
 
-  const SYSTEM = `You are a personal AI assistant. You have access to Google Calendar, Gmail, Google Tasks, reminders, web search, weather, and smart scheduling.
-Always reply in the same language the user writes in (Hebrew or English). Be concise and direct.
-NEVER ask the user for clarification before acting — make your best judgment and call the tool immediately.
-NEVER confirm an action without first calling the appropriate tool. Tool call MUST happen first, then confirmation.
+  const SYSTEM = `You are a personal AI assistant (Hebrew/English). Reply in the user's language. Be concise.
+Now: ${israelTimeStr} (UTC+3). All ISO strings MUST use +03:00 suffix. Today: ${israelDateStr}.
+NEVER confirm an action without calling the tool first. CALL THE TOOL, then confirm.${contextSection}${factsSection}
 
-Current Israel date/time: ${israelTimeStr}
-IMPORTANT: All times are in Israel time (UTC+3). Always include +03:00 suffix in ISO 8601 strings.
-Example: 17:20 today → ${israelDateStr}T17:20:00+03:00${contextSection}${factsSection}
+## Context keywords → listName:
+- דינמיקה/dynamika → "דינמיקה" | spinz/ספינז/אופניים → "Spinz" | סולשיין/sunshine → "סולשיין"
+- תכשיטים/jewelry → "תכשיטים" | חיי בית/הבית → "חיי בית"
+- No keyword → default list: "${activeCtx?.taskList ?? "My Tasks"}"
 
-## Context auto-detection — CRITICAL:
-Always scan the message for context keywords and route accordingly, even if no active context is set:
-- "דינמיקה" / "dynamika" → listName="דינמיקה", memory context="dynamika"
-- "spinz" / "ספינז" / "אופניים" / "האופניים" → listName="Spinz", memory context="spinz"
-- "סולשיין" / "sunshine" / "עומר וירין" / "סולשיין האוס" → listName="סולשיין", memory context="sunshine"
-- "תכשיטים" / "jewelry" → listName="תכשיטים", memory context="jewelry"
-- "חיי בית" / "הבית" / "ביתי" → listName="חיי בית", memory context="home"
-If no context keyword found → use active context default: "${activeCtx?.taskList ?? "first list"}"
+## Tasks — CALL add_task IMMEDIATELY, no confirmation first:
+- listName from keywords above. Default: "${activeCtx?.taskList ?? "My Tasks"}".
+- בבוקר=08:00 בצהריים=12:00 אחה"צ=15:00 בערב=18:00 בלילה=21:00 no time→09:00
+- Reply: ✅ נוסף: "<title>"
 
-## Adding tasks:
-- ALWAYS call add_task FIRST, then confirm. Never say "נוסף" without calling the tool.
-- Detect listName from message context keywords (above). Default: "${activeCtx?.taskList ?? ""}".
-- "בבוקר"=08:00, "בצהריים"=12:00, "אחה\"צ"=15:00, "בערב"=18:00, "בלילה"=21:00. No time → 09:00.
-- After: ✅ נוסף: "<title>"${activeCtx ? ` ל-${activeCtx.name}` : ""}
+## Reminders — CALL set_reminder IMMEDIATELY when user says תזכיר לי / remind me:
+- בעוד שעה=now+1h | בשעה X=today X | מחר=tomorrow
+- Reply: ✅ תזכורת: "<text>" ב-<time>
 
-## Reminders:
-- ALWAYS call set_reminder FIRST when user says "תזכיר לי" or "remind me".
-- "בעוד שעה" = now + 1 hour. "בשעה X" = today at X. "מחר בשעה X" = tomorrow at X.
-- After: ✅ תזכורת הוגדרה: "<text>" ב-<time>
+## Calendar — use add_calendar_event for Hebrew, quick_add for English only:
+- כל שבוע ביום X → RRULE:FREQ=WEEKLY;BYDAY=<day> | כל יום → RRULE:FREQ=DAILY
+- No end time → 1h after start. Reply: ✅ ביומן: "<title>"
 
-## Calendar events:
-- ALWAYS use add_calendar_event for Hebrew input.
-- Recurring: "כל שבוע ביום X" → ["RRULE:FREQ=WEEKLY;BYDAY=<day>"], "כל יום" → ["RRULE:FREQ=DAILY"].
-- No end time → default 1 hour after start.
-- After: ✅ נוסף ליומן: "<title>"
+## Email — draft first, show user, ask "האם לשלוח?". Call send_email ONLY after yes.
 
-## User memory:
-- When the user shares personal info relevant to the current context (contacts, prices, processes, preferences), call remember_fact with context="${activeCtx?.key ?? "global"}".
-- Use stored facts naturally without saying you're "looking them up".
+## Memory — call remember_fact when user shares contacts/prices/info. Use stored facts naturally.
 
-## Web search:
-- Use web_search for real-time questions: prices, news, exchange rates.
-- Use get_weather for weather. Use get_exchange_rate for currency rates.
+## Search — web_search for news/prices, get_weather for weather, get_exchange_rate for currency.
 
-## Smart scheduling:
-- Use find_free_slots when user asks "מתי אני פנוי" or wants a meeting slot.
-- Present in natural language: "יש לך חלון ב-10:00–12:00 וב-15:00–17:00"
+## Scheduling — find_free_slots for "מתי אני פנוי". Reply: "יש לך חלון ב-10:00–12:00"
 
-## Sending emails:
-- FIRST draft and show the email, ask "האם לשלוח?". Do NOT call send_email yet.
-- Only call send_email after explicit user confirmation.
-- After: ✅ המייל נשלח!
-
-## Analyzing images:
-- Describe what you see and extract actionable info (dates, amounts, tasks).
-- Proactively offer to add calendar events, tasks, or reminders based on the image content.`;
+## Images — describe, extract tasks/dates, offer to add to calendar/tasks.`;
 
   // Build the user message content
   const userContent: Anthropic.ContentBlockParam[] = extraContent
@@ -667,6 +643,29 @@ bot.command("brief", async (ctx) => {
   }
 });
 
+const BOT_START_TIME = Date.now();
+
+bot.command("status", async (ctx) => {
+  const active = await getActiveContext();
+  const reminders = (await loadReminders()).filter((r) => r.chatId === ctx.chat.id);
+  const facts = await loadUserFacts(undefined);
+  const authOk = await checkGoogleAuth();
+  const uptimeMs = Date.now() - BOT_START_TIME;
+  const uptimeH = Math.floor(uptimeMs / 3600000);
+  const uptimeM = Math.floor((uptimeMs % 3600000) / 60000);
+
+  const lines = [
+    "🤖 *סטטוס הבוט*",
+    "",
+    `📍 קונטקסט פעיל: ${active ? `${active.emoji} ${active.name}` : "כללי"}`,
+    `⏰ תזכורות ממתינות: ${reminders.length}`,
+    `🧠 עובדות בזיכרון: ${facts.length}`,
+    `🔑 Google Auth: ${authOk ? "✅ תקין" : "❌ נכשל"}`,
+    `⏱ זמן פעילות: ${uptimeH}h ${uptimeM}m`,
+  ];
+  return ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
+});
+
 bot.command("debug_task", async (ctx) => {
   await ctx.replyWithChatAction("typing");
   try {
@@ -727,7 +726,7 @@ bot.on("message:voice", async (ctx) => {
     if (!transcript) { stopTyping(); return ctx.reply("לא הצלחתי להבין את ההקלטה, נסה שוב."); }
     const reply = await runAgent(ctx.chat.id, transcript);
     stopTyping();
-    await safeSend(ctx.chat.id, `🎙 _${transcript}_\n\n${reply}`);
+    await safeSend(ctx.chat.id, `🎙 "${transcript}"\n\n${reply}`);
   } catch (err) {
     stopTyping();
     await ctx.reply(`שגיאה בתמלול: ${err instanceof Error ? err.message : String(err)}`);

@@ -66,7 +66,8 @@ export async function addTask(
   const tasks = google.tasks({ version: "v1", auth });
 
   const lists = await getTaskLists();
-  let list = lists[0];
+  // Default to "My Tasks" if no listName specified; fall back to first list
+  let list = lists.find((l) => l.title.toLowerCase() === "my tasks") ?? lists[0];
   if (listName) {
     const found = lists.find((l) => l.title.toLowerCase().includes(listName.toLowerCase()));
     if (found) {
