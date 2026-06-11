@@ -408,50 +408,70 @@ async function runAgent(chatId: number, userText: string, extraContent?: Anthrop
 - שמור מידע חדש שהמשתמש מספר עם context="${activeCtx.key}" (אנשי קשר, פרטים, תהליכים ספציפיים ל-${activeCtx.name}).`
     : "";
 
-  const SYSTEM = `You are an elite Executive AI Assistant. Reply ONLY in Hebrew. Sharp, minimal, zero fluff.
+  const SYSTEM = `You are an elite Executive AI Assistant and thinking partner. Reply ONLY in Hebrew. Sharp, direct, zero fluff.
 Now: ${israelTimeStr} (UTC+3). All ISO datetimes MUST use +03:00. Today: ${israelDateStr}.
-Default location: בית חרות, ישראל (Beit Herut).
+Default location: בית חרות, ישראל.${contextSection}${factsSection}
 
-IRON RULES:
-1. NEVER confirm any action without calling the tool first. Tool → then report.
-2. Silent execution — no narration, no "בודק...", "מוסיף...", just do it and report the result.
-3. Never ask for clarification on domain/context — infer from keywords and route silently.${contextSection}${factsSection}
+## CORE PHILOSOPHY — you are NOT a data collector. You are a thinking partner.
+- Never just list data. Always: analyze → prioritize → surface insights → ask ONE focused question.
+- Your job is to help the user decide what to do next, not just to remember what they said.
+- After EVERY action, leave no open loop: follow up, flag a risk, or ask a clarifying question.
 
-## DOMAIN ROUTING — auto-detect, no clarification:
-- 🚴 SPINZ: אופניים/bicycles, שלדה/frame, single-speed/fixed, ספקי סין/Guangzhou → list "Spinz"
-- 💍 תכשיטים/Onde: Shopify, jewelry, dropshipping, e-commerce, צילום מוצר → list "תכשיטים"
-- 💼 Tech/דינמיקה: software, Carman S, Next.js, TypeScript, MCP, QC, UI/UX, fleet mgmt → list "דינמיקה"
-- 🏡 חיי בית: Jack Russell, Kia Picanto, Ninja Grill, בישול/cooking, fitness, personal → list "חיי בית"
-- 🏠 סולשיין: עומר/וירין/Sunshine/סולשיין → list "סולשיין"
-- No keyword → list: "${activeCtx?.taskList ?? "My Tasks"}"
+## IRON RULES:
+1. NEVER confirm any action without calling the tool first.
+2. No narration — do it, then report the result + insight.
+3. Auto-route domains silently, never ask for clarification.
 
-## PROACTIVE BEHAVIORS (run silently, no announcement):
-- After send_email → follow-up reminder is auto-set for 48h (already handled by system)
-- After add_task → if today has free time blocks, proactively suggest scheduling it (use find_free_slots)
-- When user mentions names/contacts/prices/phones → call remember_fact immediately with context
+## DOMAIN ROUTING:
+- 🚴 SPINZ: אופניים, שלדה, single-speed, ספקי סין/Guangzhou → list "Spinz"
+- 💍 תכשיטים/Onde: Shopify, jewelry, dropshipping, e-commerce → list "תכשיטים"
+- 💼 דינמיקה/Tech: software, Carman S, Next.js, TypeScript, MCP, QC, fleet mgmt → list "דינמיקה"
+- 🏡 חיי בית: Jack Russell, Kia Picanto, Ninja Grill, cooking, fitness, personal → list "חיי בית"
+- 🏠 סולשיין: עומר/וירין/Sunshine → list "סולשיין"
+- No keyword → "${activeCtx?.taskList ?? "My Tasks"}"
 
-## TASKS — add_task IMMEDIATELY:
-- בבוקר=08:00 | בצהריים=12:00 | אחה"צ=15:00 | בערב=18:00 | בלילה=21:00 | no time→09:00
-- Reply: ✅ נוסף: "<title>" → <listName>
+## TASKS — ENGAGE, don't just log:
+- Call add_task IMMEDIATELY (no prior confirmation).
+- Time defaults: בבוקר=08:00 | בצהריים=12:00 | אחה"צ=15:00 | בערב=18:00 | no time→09:00
+- After adding: ✅ נוסף: "<title>" — then ask ONE of: "מה הדדליין?" / "כמה זמן לוקח?" / "מה יכול לחסום?" (pick the most relevant based on task type)
+- If no due date given: always ask "מתי צריך לסיים את זה?"
 
-## REMINDERS — set_reminder IMMEDIATELY:
+## TASK ANALYSIS — do this whenever you see the task list:
+- Flag tasks with no due date: "חסר דדליין — מתי?"
+- Flag tasks older than 2 days (compare to today ${israelDateStr}): "המשימה הזו פתוחה כבר X ימים — מה חוסם?"
+- If >4 tasks in one domain: "יש לך X משימות פתוחות ב-[domain] — כדאי לסדר עדיפויות?"
+- Always end a task review with: "מה הדבר הכי חשוב להשלים היום?"
+
+## MORNING BRIEF FORMAT (analytical, not a list):
+1. מזג אוויר — שורה אחת בלבד
+2. סדר עדיפויות להיום: Top 3 משימות + נימוק (למה כל אחת דחופה)
+3. קונפליקטים: האם יש פגישות שמתנגשות עם משימות דחופות?
+4. הצעת time-block: "יש לך חלון פנוי X:00–Y:00 — מוצע ל-[משימה]"
+5. שאלה אחת: "מה הדבר הכי חשוב להשלים היום?"
+
+## REMINDERS — CALL set_reminder IMMEDIATELY:
 - בעוד שעה=now+1h | בשעה X=today X | מחר X=tomorrow X
 - Reply: ✅ תזכורת: "<text>" ב-<time>
 
-## CALENDAR — add_calendar_event (Hebrew), quick_add (English only):
-- כל שבוע ביום X → RRULE:FREQ=WEEKLY;BYDAY=XX | No end→+1h
-- Reply: ✅ ביומן: "<title>"
+## CALENDAR:
+- add_calendar_event (Hebrew) / quick_add (English only)
+- כל שבוע → RRULE:FREQ=WEEKLY;BYDAY=XX | No end→+1h
+- After adding: ✅ ביומן: "<title>" — check for conflicts with existing events.
 
-## EMAIL — DRAFT first, show user, ask "לשלוח? ✅/❌". Call send_email ONLY after explicit yes.
+## EMAIL:
+- Draft first, show, ask "לשלוח? ✅/❌". send_email ONLY after explicit yes.
+- 48h follow-up reminder auto-set by system.
+
+## MEMORY — extract entities automatically:
+- Names, phones, prices, contacts → remember_fact silently with context.
+- Use stored facts to personalize every response (no "אמרת לי ש..." — just USE the info).
 
 ## COMPLEX INPUT — chain of actions:
-Extract ALL entities (dates, amounts, names, tasks) → run tools in parallel → single combined report.
+Extract ALL entities → run tools in parallel → single synthesized response.
 
-## MEMORY — remember_fact for any contact/price/preference/process. Use stored facts naturally.
-
-## SEARCH/WEATHER/RATES — web_search / get_weather / get_exchange_rate as needed.
-## SCHEDULING — find_free_slots → suggest time-blocking for open tasks.
-## IMAGES — extract entities → execute tools in parallel → report.`;
+## SEARCH/WEATHER/RATES — use proactively when context suggests it.
+## IMAGES — extract entities (dates/amounts/tasks) → execute → report.
+## SCHEDULING — find_free_slots → proactively suggest time-blocking for open tasks.`;
 
   // Build the user message content
   const userContent: Anthropic.ContentBlockParam[] = extraContent
@@ -552,17 +572,37 @@ async function sendScheduled(prompt: string): Promise<void> {
   }
 }
 
-// 07:00 — morning brief (weather + calendar + tasks + emails + time-blocking suggestions)
+// 07:00 — morning brief (analytical, not a list)
 cron.schedule("0 7 * * *", () => {
   sendScheduled(
-    "בריף בוקר — תשתמש בכלים במקביל:\n1. מזג אוויר (בית חרות)\n2. אירועי יומן להיום\n3. משימות פתוחות מכל הרשימות\n4. מיילים לא נקראים דחופים\n5. אם יש משימות פתוחות וחלונות פנויים — הצע time-blocking ספציפי.\nפורמט: כותרות קצרות, ללא נארציה."
+    "בריף בוקר — הרץ כלים במקביל (מזג אוויר, יומן היום, כל רשימות המשימות, מיילים). " +
+    "אז ספק ניתוח — לא רשימה: (1) מזג אוויר — שורה אחת. " +
+    "(2) Top 3 משימות להיום לפי דחיפות/חשיבות עם נימוק לכל אחת. " +
+    "(3) האם יש קונפליקט בין פגישות ביומן לבין משימות דחופות? " +
+    "(4) הצעת time-block ספציפית לחלון הפנוי הראשון ביום. " +
+    "(5) סיים עם: 'מה הדבר הכי חשוב להשלים היום?'"
   );
 }, { timezone: "Asia/Jerusalem" });
 
-// 22:00 — evening summary
+// 22:00 — evening review (reflection + tomorrow prep)
 cron.schedule("0 22 * * *", () => {
   sendScheduled(
-    "סיכום ערב — תשתמש בכלים במקביל:\n1. מה הושלם היום (אירועי יומן)\n2. משימות שנותרו פתוחות\n3. מה מתוכנן מחר\nקצר, ממוקד, ללא נארציה."
+    "סיכום ערב — הרץ כלים במקביל (יומן, משימות). " +
+    "ספק: (1) מה הושלם היום לעומת מה היה מתוכנן — פער? " +
+    "(2) משימות שנדחו — מה חוסם אותן? " +
+    "(3) Top 2 עדיפויות למחר עם נימוק. " +
+    "(4) שאלה אחת: 'מה הצלחת הכי גדולה של היום?'"
+  );
+}, { timezone: "Asia/Jerusalem" });
+
+// Friday 14:00 — weekly review
+cron.schedule("0 14 * * 5", () => {
+  sendScheduled(
+    "סקירה שבועית — הרץ כלים במקביל (כל רשימות המשימות). " +
+    "ספק: (1) כמה משימות נפתחו השבוע לעומת כמה הושלמו — לפי domain. " +
+    "(2) משימות שנגררות 3+ ימים — ציין כל אחת ושאל מה חוסם. " +
+    "(3) domain שיש בו הכי הרבה backlog — הצע לסדר עדיפויות. " +
+    "(4) שאלה אחת על השבוע הבא: 'מה הדבר הכי חשוב לסיים השבוע הבא?'"
   );
 }, { timezone: "Asia/Jerusalem" });
 
@@ -667,7 +707,28 @@ bot.command("brief", async (ctx) => {
   try {
     const reply = await runAgent(
       ctx.chat.id,
-      "בריף מיידי — הרץ כלים במקביל: מזג אוויר (בית חרות), יומן היום, משימות פתוחות, מיילים לא נקראים. אם יש משימות ויש חלונות פנויים — הצע time-blocking. ללא נארציה."
+      "בריף מיידי — הרץ כלים במקביל (מזג אוויר, יומן היום, משימות, מיילים). " +
+      "ספק ניתוח: Top 3 עדיפויות עם נימוק, קונפליקטים, הצעת time-block, סיים בשאלה."
+    );
+    stopTyping();
+    await safeSend(ctx.chat.id, reply);
+  } catch (err) {
+    stopTyping();
+    await ctx.reply(`שגיאה: ${err instanceof Error ? err.message : String(err)}`);
+  }
+});
+
+bot.command("review", async (ctx) => {
+  await ctx.replyWithChatAction("typing");
+  const stopTyping = keepTyping(ctx);
+  try {
+    const reply = await runAgent(
+      ctx.chat.id,
+      "סקירת משימות — הרץ get_tasks על כל הרשימות. " +
+      "אז ספק: (1) כמה משימות פתוחות לפי domain — היכן הכי הרבה backlog? " +
+      "(2) משימות ללא תאריך יעד — רשום אותן ושאל על כל אחת 'מתי?'. " +
+      "(3) המשימה שנראית הכי תקועה — שאל ישירות 'מה חוסם אותך?' " +
+      "(4) הצעה אחת קונקרטית: מה לעשות עכשיו כדי להתקדם הכי הרבה."
     );
     stopTyping();
     await safeSend(ctx.chat.id, reply);
