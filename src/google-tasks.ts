@@ -9,6 +9,7 @@ export interface Task {
   status: "needsAction" | "completed";
   listId: string;
   listTitle: string;
+  updated: string | null; // last-modified timestamp — proxy for task age / staleness
 }
 
 export interface TaskList {
@@ -49,6 +50,7 @@ export async function getTasks(listName?: string): Promise<Task[]> {
           status: (t.status as "needsAction" | "completed") ?? "needsAction",
           listId: list.id,
           listTitle: list.title,
+          updated: t.updated ?? null,
         });
       }
     })
@@ -100,15 +102,21 @@ export async function addTask(
     status: "needsAction",
     listId: list.id,
     listTitle: list.title,
+    updated: t.updated ?? null,
   };
 }
 
-export async function completeTask(taskId: string, listId: string): Promise<void> {
+export async function completeTask(taskId: string, listId: string): Promise<{ title: string; listTitle: string }> {
   const auth = await getAuthClient();
   const tasks = google.tasks({ version: "v1", auth });
-  await tasks.tasks.patch({
+  const res = await tasks.tasks.patch({
     tasklist: listId,
     task: taskId,
     requestBody: { status: "completed" },
   });
+  const lists = await getTaskLists();
+  return {
+    title: res.data.title ?? "",
+    listTitle: lists.find((l) => l.id === listId)?.title ?? listId,
+  };
 }

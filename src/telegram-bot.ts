@@ -22,6 +22,9 @@ import { loadReminders, upsertReminder, deleteReminder, type Reminder } from "./
 import { loadUserFacts, upsertFact, deleteFact } from "./user-memory.js";
 import { webSearch, getWeather, getExchangeRate } from "./web-search.js";
 import { CONTEXTS, getActiveContext, setActiveContext, resolveContext } from "./context-store.js";
+import { getTodayFocus, setTodayFocus, markFocusDone, formatFocus } from "./focus-store.js";
+import { logCompletion, getWeekStats } from "./stats-store.js";
+import { listRecurring, addRecurring, deleteRecurring, popDueToday, describeSchedule } from "./recurring-store.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CHAT_ID_FILE = join(__dirname, "..", "data", "chat-id.json");
@@ -45,7 +48,8 @@ const scheduledTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
 
 const MAIN_KEYBOARD = new Keyboard()
   .text("➕ משימה").text("📅 אירוע").text("⏰ תזכורת").row()
-  .text("📊 בריף").text("✅ סקירה").text("📧 מיילים")
+  .text("🎯 פוקוס").text("📊 בריף").text("✅ סקירה").row()
+  .text("📧 מיילים").text("📈 נתונים")
   .resized()
   .persistent();
 
@@ -324,6 +328,61 @@ const TOOLS: Anthropic.Tool[] = [
       required: ["date", "durationMinutes"],
     },
   },
+  {
+    name: "set_daily_focus",
+    description: "Set today's 1-3 focus tasks (the things that MUST happen today). Call when the user states their top priorities for the day.",
+    input_schema: {
+      type: "object",
+      properties: {
+        items: { type: "array", items: { type: "string" }, description: "1-3 focus task descriptions." },
+      },
+      required: ["items"],
+    },
+  },
+  {
+    name: "get_daily_focus",
+    description: "Get today's focus tasks and their done/pending status. Call in every brief and whenever the user asks what to work on.",
+    input_schema: { type: "object", properties: {} },
+  },
+  {
+    name: "mark_focus_done",
+    description: "Mark a daily-focus item as completed, by its number (1-3) or by text match. Call when the user says they finished a focus task.",
+    input_schema: {
+      type: "object",
+      properties: {
+        indexOrText: { type: "string", description: "1-based index ('1','2','3') or part of the item text." },
+      },
+      required: ["indexOrText"],
+    },
+  },
+  {
+    name: "add_recurring_task",
+    description: "Create a recurring task template that auto-adds a Google Task on schedule. Use for 'כל יום/כל שבוע/כל חודש' task requests.",
+    input_schema: {
+      type: "object",
+      properties: {
+        title: { type: "string" },
+        listName: { type: "string", description: "Target task list." },
+        schedule: { type: "string", description: "'daily' | 'weekly:0'-'weekly:6' (0=Sunday) | 'monthly:1'-'monthly:28'." },
+      },
+      required: ["title", "schedule"],
+    },
+  },
+  {
+    name: "list_recurring_tasks",
+    description: "List all recurring task templates.",
+    input_schema: { type: "object", properties: {} },
+  },
+  {
+    name: "delete_recurring_task",
+    description: "Delete a recurring task template by its id.",
+    input_schema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] },
+  },
+  {
+    name: "get_productivity_stats",
+    description: "Get task-completion statistics: this week vs last week, breakdown by domain and by day. Use for weekly reviews and when the user asks about progress/velocity.",
+    input_schema: { type: "object", properties: {} },
+  },
 ];
 
 // ── Tool executor ─────────────────────────────────────────────────────────────
@@ -340,9 +399,11 @@ async function executeTool(name: string, input: Record<string, unknown>, chatId:
           await addTask(input.title as string, input.listName as string | undefined, input.due as string | undefined, input.notes as string | undefined),
           null, 2
         ); break;
-      case "complete_task":
-        await completeTask(input.taskId as string, input.listId as string);
-        out = JSON.stringify({ ok: true }); break;
+      case "complete_task": {
+        const done = await completeTask(input.taskId as string, input.listId as string);
+        await logCompletion(done.title, done.listTitle);
+        out = JSON.stringify({ ok: true, ...done }); break;
+      }
       case "get_calendar_events":
         out = JSON.stringify(
           await getCalendarEvents(input.timeMin as string | undefined, input.timeMax as string | undefined),
@@ -412,6 +473,28 @@ async function executeTool(name: string, input: Record<string, unknown>, chatId:
         out = JSON.stringify(
           await findFreeSlots(input.date as string, input.durationMinutes as number), null, 2
         ); break;
+      case "set_daily_focus":
+        out = JSON.stringify(await setTodayFocus(input.items as string[]), null, 2); break;
+      case "get_daily_focus": {
+        const focus = await getTodayFocus();
+        out = focus ? JSON.stringify(focus, null, 2) : JSON.stringify({ set: false, message: "No focus set for today yet" }); break;
+      }
+      case "mark_focus_done": {
+        const updated = await markFocusDone(input.indexOrText as string);
+        out = updated ? JSON.stringify(updated, null, 2) : JSON.stringify({ ok: false, message: "Focus item not found or no focus set today" }); break;
+      }
+      case "add_recurring_task":
+        out = JSON.stringify(
+          await addRecurring(input.title as string, (input.listName as string) ?? "My Tasks", input.schedule as string), null, 2
+        ); break;
+      case "list_recurring_tasks": {
+        const recs = await listRecurring();
+        out = JSON.stringify(recs.map((r) => ({ ...r, scheduleHebrew: describeSchedule(r.schedule) })), null, 2); break;
+      }
+      case "delete_recurring_task":
+        out = JSON.stringify({ ok: await deleteRecurring(input.id as string) }); break;
+      case "get_productivity_stats":
+        out = JSON.stringify(await getWeekStats(), null, 2); break;
       default:
         out = `Unknown tool: ${name}`;
     }
@@ -481,24 +564,42 @@ Default location: בית חרות, ישראל.${contextSection}${factsSection}
 - 🏠 סולשיין: עומר/וירין/Sunshine → list "סולשיין"
 - No keyword → "${activeCtx?.taskList ?? "My Tasks"}"
 
+## DAILY FOCUS — the backbone of the day:
+- Today's focus = the 1-3 tasks that MUST happen today. Stored via set_daily_focus.
+- EVERY brief starts by calling get_daily_focus. If not set → ask: "מה 3 הדברים שחייבים לקרות היום?" then call set_daily_focus with the answer.
+- When user says they finished something → check if it matches a focus item → mark_focus_done + celebrate briefly: "🎯 2/3 הושלמו".
+- If user asks "מה עכשיו?" → answer with the next unfinished focus item.
+
 ## TASKS — ENGAGE, don't just log:
 - Call add_task IMMEDIATELY (no prior confirmation).
+- PRIORITY MATRIX: classify every new task silently (Eisenhower): דחוף+חשוב=🔴 | חשוב=🟡 | דחוף=🟠 | אחר=⚪. Prefix the task title with the emoji (e.g. "🔴 לשלם לספק").
 - Time defaults: בבוקר=08:00 | בצהריים=12:00 | אחה"צ=15:00 | בערב=18:00 | no time→09:00
-- After adding: ✅ נוסף: "<title>" — then ask ONE of: "מה הדדליין?" / "כמה זמן לוקח?" / "מה יכול לחסום?" (pick the most relevant based on task type)
+- After adding: ✅ נוסף: "<title>" — then ask ONE of: "מה הדדליין?" / "כמה זמן לוקח?" / "מה יכול לחסום?" (pick the most relevant)
 - If no due date given: always ask "מתי צריך לסיים את זה?"
 
-## TASK ANALYSIS — do this whenever you see the task list:
+## FOLLOW-UP CHAINS — after complete_task:
+- Think: what's the natural NEXT step after this task? Suggest it: "סיימת X — השלב הבא הוא Y, להוסיף כמשימה?"
+- Example: בדק ספק → הצעת מחיר. שלח הצעה → תזכורת מעקב. קנה חלק → התקנה.
+
+## TASK ANALYSIS — whenever you see the task list:
+- Sort by priority emoji: 🔴 first, then 🟡, 🟠, ⚪.
 - Flag tasks with no due date: "חסר דדליין — מתי?"
-- Flag tasks older than 2 days (compare to today ${israelDateStr}): "המשימה הזו פתוחה כבר X ימים — מה חוסם?"
-- If >4 tasks in one domain: "יש לך X משימות פתוחות ב-[domain] — כדאי לסדר עדיפויות?"
-- Always end a task review with: "מה הדבר הכי חשוב להשלים היום?"
+- Flag stale tasks: 'updated' older than 3 days from today (${israelDateStr}) → "פתוחה X ימים — מה חוסם?"
+- If >4 tasks in one domain: "יש לך X משימות ב-[domain] — לסדר עדיפויות?"
+- Always end with: "מה הדבר הכי חשוב להשלים היום?"
+
+## CALENDAR HEALTH — check whenever you see today's events:
+- Back-to-back meetings with no buffer → "⚠️ אין הפסקה בין X ל-Y"
+- No lunch window 12:00-14:00 → "⚠️ אין חלון לארוחת צהריים"
+- Meeting after 20:00 → flag it.
 
 ## MORNING BRIEF FORMAT (analytical, not a list):
-1. מזג אוויר — שורה אחת בלבד
-2. סדר עדיפויות להיום: Top 3 משימות + נימוק (למה כל אחת דחופה)
-3. קונפליקטים: האם יש פגישות שמתנגשות עם משימות דחופות?
-4. הצעת time-block: "יש לך חלון פנוי X:00–Y:00 — מוצע ל-[משימה]"
-5. שאלה אחת: "מה הדבר הכי חשוב להשלים היום?"
+1. 🎯 פוקוס היום (get_daily_focus; if unset — ask for it at the END of the brief)
+2. מזג אוויר — שורה אחת בלבד
+3. Top 3 משימות לפי priority matrix + נימוק
+4. קונפליקטים + calendar health warnings
+5. הצעת time-block: "חלון פנוי X:00–Y:00 — מוצע ל-[משימה]"
+6. שאלה: "מה 3 הדברים שחייבים לקרות היום?" (only if focus unset)
 
 ## REMINDERS — CALL set_reminder IMMEDIATELY:
 - בעוד שעה=now+1h | בשעה X=today X | מחר X=tomorrow X
@@ -623,37 +724,78 @@ async function sendScheduled(prompt: string): Promise<void> {
   }
 }
 
-// 07:00 — morning brief (analytical, not a list)
+// 06:30 — apply recurring task templates (silent unless something was added)
+cron.schedule("30 6 * * *", async () => {
+  try {
+    const due = await popDueToday();
+    if (due.length === 0) return;
+    for (const t of due) {
+      await addTask(t.title, t.listName);
+      console.log(`[recurring] added "${t.title}" → ${t.listName}`);
+    }
+    if (registeredChatId) {
+      const lines = due.map((t) => `• ${t.title} → ${t.listName}`).join("\n");
+      await safeSend(registeredChatId, `🔄 משימות קבועות נוספו להיום:\n${lines}`);
+    }
+  } catch (err) {
+    console.error("[recurring] error:", err);
+  }
+}, { timezone: "Asia/Jerusalem" });
+
+// 07:00 — morning brief (focus-first, analytical)
 cron.schedule("0 7 * * *", () => {
   sendScheduled(
-    "בריף בוקר — הרץ כלים במקביל (מזג אוויר, יומן היום, כל רשימות המשימות, מיילים). " +
-    "אז ספק ניתוח — לא רשימה: (1) מזג אוויר — שורה אחת. " +
-    "(2) Top 3 משימות להיום לפי דחיפות/חשיבות עם נימוק לכל אחת. " +
-    "(3) האם יש קונפליקט בין פגישות ביומן לבין משימות דחופות? " +
-    "(4) הצעת time-block ספציפית לחלון הפנוי הראשון ביום. " +
-    "(5) סיים עם: 'מה הדבר הכי חשוב להשלים היום?'"
+    "בריף בוקר — הרץ כלים במקביל (get_daily_focus, מזג אוויר, יומן היום, כל רשימות המשימות, מיילים). " +
+    "פורמט: (1) 🎯 פוקוס היום אם הוגדר. " +
+    "(2) מזג אוויר — שורה אחת. " +
+    "(3) Top 3 משימות לפי priority matrix (🔴 קודם) עם נימוק. " +
+    "(4) קונפליקטים ביומן + בדיקת בריאות: פגישות צמודות, חוסר הפסקת צהריים. " +
+    "(5) הצעת time-block לחלון הפנוי הראשון. " +
+    "(6) אם אין פוקוס מוגדר — סיים עם: 'מה 3 הדברים שחייבים לקרות היום?'"
   );
 }, { timezone: "Asia/Jerusalem" });
 
-// 22:00 — evening review (reflection + tomorrow prep)
+// 12:30 — midday stale-task + focus check
+cron.schedule("30 12 * * *", () => {
+  sendScheduled(
+    "צ'ק צהריים — הרץ get_daily_focus ו-get_tasks במקביל. " +
+    "ספק עדכון קצרצר: (1) סטטוס פוקוס: כמה מתוך 3 הושלמו עד עכשיו. " +
+    "(2) משימות תקועות (updated לפני 3+ ימים) — בחר את השתיים הכי חשובות ושאל ישירות: 'מה חוסם את X?' " +
+    "(3) אם הכל בשליטה — שורה אחת בלבד: '✅ הכל במסלול'. אל תציף."
+  );
+}, { timezone: "Asia/Jerusalem" });
+
+// 22:00 — evening review (focus scorecard + reflection)
 cron.schedule("0 22 * * *", () => {
   sendScheduled(
-    "סיכום ערב — הרץ כלים במקביל (יומן, משימות). " +
-    "ספק: (1) מה הושלם היום לעומת מה היה מתוכנן — פער? " +
-    "(2) משימות שנדחו — מה חוסם אותן? " +
+    "סיכום ערב — הרץ get_daily_focus, get_tasks, get_productivity_stats במקביל. " +
+    "ספק: (1) 🎯 ציון פוקוס: X/3 הושלמו — אם פחות מ-3, מה נשאר ולמה? " +
+    "(2) מה הושלם היום בפועל (מהסטטיסטיקה). " +
     "(3) Top 2 עדיפויות למחר עם נימוק. " +
-    "(4) שאלה אחת: 'מה הצלחת הכי גדולה של היום?'"
+    "(4) שאלה: 'מה ההצלחה הכי גדולה של היום?'"
   );
 }, { timezone: "Asia/Jerusalem" });
 
-// Friday 14:00 — weekly review
+// Sunday 08:00 — weekly planning session
+cron.schedule("0 8 * * 0", () => {
+  sendScheduled(
+    "תכנון שבועי (ראשון בבוקר) — הרץ get_productivity_stats, get_tasks (כל הרשימות), ויומן השבוע במקביל. " +
+    "ספק: (1) 📈 שבוע שעבר: כמה הושלמו לעומת השבוע הקודם — מגמה. " +
+    "(2) Backlog לפי domain — איפה הכי הרבה משימות פתוחות. " +
+    "(3) הצע Top 3 יעדים לשבוע — אחד לכל domain עמוס. " +
+    "(4) הצע 2-3 time-blocks ספציפיים בימים הקרובים לפי החלונות הפנויים ביומן. " +
+    "(5) סיים: 'מה היעד הכי חשוב של השבוע?'"
+  );
+}, { timezone: "Asia/Jerusalem" });
+
+// Friday 14:00 — weekly review (closing the week)
 cron.schedule("0 14 * * 5", () => {
   sendScheduled(
-    "סקירה שבועית — הרץ כלים במקביל (כל רשימות המשימות). " +
-    "ספק: (1) כמה משימות נפתחו השבוע לעומת כמה הושלמו — לפי domain. " +
-    "(2) משימות שנגררות 3+ ימים — ציין כל אחת ושאל מה חוסם. " +
-    "(3) domain שיש בו הכי הרבה backlog — הצע לסדר עדיפויות. " +
-    "(4) שאלה אחת על השבוע הבא: 'מה הדבר הכי חשוב לסיים השבוע הבא?'"
+    "סקירה שבועית (סוף שבוע) — הרץ get_productivity_stats ו-get_tasks במקביל. " +
+    "ספק: (1) 📊 סיכום: X משימות הושלמו השבוע (לפי domain) — לעומת שבוע שעבר. " +
+    "(2) משימות שנגררות — ציין כל אחת ושאל מה חוסם. " +
+    "(3) מה לדחות רשמית לשבוע הבא ומה לבטל בכלל? " +
+    "(4) שאלה: 'מה הדבר הכי חשוב לסיים בשבוע הבא?'"
   );
 }, { timezone: "Asia/Jerusalem" });
 
@@ -677,7 +819,7 @@ bot.command("start", async (ctx) => {
   histories.delete(ctx.chat.id);
   wizardStates.delete(ctx.chat.id);
   return ctx.reply(
-    "מוכן לפעולה.\n\n*תחומים:* 🚴 SPINZ | 💍 תכשיטים | 💼 דינמיקה | 🏡 בית | 🏠 סולשיין\n_בריף יומי: 07:00 | סיכום ערב: 22:00 | סקירה שבועית: שישי 14:00_",
+    "מוכן לפעולה.\n\n*תחומים:* 🚴 SPINZ | 💍 תכשיטים | 💼 דינמיקה | 🏡 בית | 🏠 סולשיין\n\n*לו\"ז אוטומטי:*\n🌅 07:00 בריף בוקר + פוקוס\n🕐 12:30 צ'ק צהריים\n🌙 22:00 סיכום ערב\n📅 ראשון 08:00 תכנון שבוע\n📊 שישי 14:00 סקירת שבוע",
     { parse_mode: "Markdown", reply_markup: MAIN_KEYBOARD }
   );
 });
@@ -737,6 +879,32 @@ bot.hears("📧 מיילים", async (ctx) => {
   const stopTyping = keepTyping(ctx);
   try {
     const reply = await runAgent(ctx.chat.id, "הראה לי את המיילים האחרונים הלא-נקראים. סכם כל אחד בשורה אחת.");
+    stopTyping();
+    await safeSend(ctx.chat.id, reply);
+  } catch (err) { stopTyping(); await ctx.reply(`שגיאה: ${err instanceof Error ? err.message : String(err)}`); }
+});
+
+bot.hears("🎯 פוקוס", async (ctx) => {
+  const focus = await getTodayFocus();
+  if (focus) {
+    const doneCount = focus.items.filter((i) => i.done).length;
+    return ctx.reply(
+      `🎯 *הפוקוס של היום* (${doneCount}/${focus.items.length}):\n\n${formatFocus(focus)}\n\n_סיימת אחת? כתוב "סיימתי 1" / "סיימתי 2"_`,
+      { parse_mode: "Markdown", reply_markup: MAIN_KEYBOARD }
+    );
+  }
+  // No focus yet — start the conversation through the agent so it calls set_daily_focus
+  await ctx.reply("עוד לא הגדרת פוקוס להיום.\n\nמה 3 הדברים שחייבים לקרות היום? (כתוב אותם בהודעה אחת)");
+});
+
+bot.hears("📈 נתונים", async (ctx) => {
+  await ctx.replyWithChatAction("typing");
+  const stopTyping = keepTyping(ctx);
+  try {
+    const reply = await runAgent(ctx.chat.id,
+      "הרץ get_productivity_stats. הצג: (1) כמה משימות הושלמו השבוע לעומת שבוע שעבר — עם אחוז שינוי. " +
+      "(2) פירוק לפי domain. (3) היום הכי פרודוקטיבי השבוע. (4) תובנה אחת קצרה — מה המגמה אומרת."
+    );
     stopTyping();
     await safeSend(ctx.chat.id, reply);
   } catch (err) { stopTyping(); await ctx.reply(`שגיאה: ${err instanceof Error ? err.message : String(err)}`); }
@@ -967,6 +1135,18 @@ bot.command("brief", async (ctx) => {
   }
 });
 
+bot.command("focus", async (ctx) => {
+  const focus = await getTodayFocus();
+  if (focus) {
+    const doneCount = focus.items.filter((i) => i.done).length;
+    return ctx.reply(
+      `🎯 *הפוקוס של היום* (${doneCount}/${focus.items.length}):\n\n${formatFocus(focus)}`,
+      { parse_mode: "Markdown", reply_markup: MAIN_KEYBOARD }
+    );
+  }
+  return ctx.reply("עוד לא הגדרת פוקוס להיום.\n\nמה 3 הדברים שחייבים לקרות היום?");
+});
+
 bot.command("review", async (ctx) => {
   await ctx.replyWithChatAction("typing");
   const stopTyping = keepTyping(ctx);
@@ -1068,7 +1248,14 @@ bot.on("message:voice", async (ctx) => {
   try {
     const transcript = await transcribeVoice(ctx.message.voice.file_id);
     if (!transcript) { stopTyping(); return ctx.reply("לא הצלחתי להבין את ההקלטה, נסה שוב."); }
-    const reply = await runAgent(ctx.chat.id, transcript);
+    // Voice notes are often a brain-dump — instruct full entity extraction + parallel execution
+    const reply = await runAgent(
+      ctx.chat.id,
+      `[הודעה קולית] "${transcript}"\n\n` +
+      "חלץ את כל הישויות מההודעה: משימות, אירועים, תזכורות, אנשי קשר, מחירים, החלטות. " +
+      "בצע את כל הפעולות הנדרשות במקביל (add_task / add_calendar_event / set_reminder / remember_fact). " +
+      "אם זו רק שאלה או שיחה — פשוט ענה. דווח בסוף מה בוצע בשורה אחת לכל פעולה."
+    );
     stopTyping();
     await safeSend(ctx.chat.id, `🎙 "${transcript}"\n\n${reply}`);
   } catch (err) {
