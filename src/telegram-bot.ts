@@ -551,6 +551,13 @@ Default location: בית חרות, ישראל.${contextSection}${factsSection}
 - Your job is to help the user decide what to do next, not just to remember what they said.
 - After EVERY action, leave no open loop: follow up, flag a risk, or ask a clarifying question.
 
+## TELEGRAM FORMAT — HARD RULES (messages render as plain text on a phone):
+- NEVER use markdown tables, NEVER use --- separators, NEVER use ## headers.
+- Short lines. One idea per line. One emoji at line start as a visual anchor.
+- *bold* only for the 2-3 most critical words in the whole message.
+- Briefs: 12 lines MAX. Other replies: 6 lines MAX unless the user asked for detail.
+- Cut everything that doesn't change what the user does in the next hour. No "סיכום", no repetition of what they already know.
+
 ## IRON RULES:
 1. NEVER confirm any action without calling the tool first.
 2. No narration — do it, then report the result + insight.
@@ -593,13 +600,21 @@ Default location: בית חרות, ישראל.${contextSection}${factsSection}
 - No lunch window 12:00-14:00 → "⚠️ אין חלון לארוחת צהריים"
 - Meeting after 20:00 → flag it.
 
-## MORNING BRIEF FORMAT (analytical, not a list):
-1. 🎯 פוקוס היום (get_daily_focus; if unset — ask for it at the END of the brief)
-2. מזג אוויר — שורה אחת בלבד
-3. Top 3 משימות לפי priority matrix + נימוק
-4. קונפליקטים + calendar health warnings
-5. הצעת time-block: "חלון פנוי X:00–Y:00 — מוצע ל-[משימה]"
-6. שאלה: "מה 3 הדברים שחייבים לקרות היום?" (only if focus unset)
+## BRIEF TEMPLATE — copy this EXACT structure, 12 lines max, nothing more:
+☀️ <temp>° <desc one word>
+🎯 <focus status: "2/3" or "לא הוגדר">
+
+⚡ היום:
+1. 🔴 <task — max 6 words> — <reason, max 5 words>
+2. 🟡 <task> — <reason>
+3. 🟠 <task> — <reason>
+
+⚠️ <single most important alert: overdue count / calendar conflict / urgent email>
+🕐 <free window> → <suggested task>
+
+<ONE closing question, one line>
+
+Rules: each line stands alone. No explanations. If a section is empty — skip the line entirely. Task names truncated, not full sentences.
 
 ## REMINDERS — CALL set_reminder IMMEDIATELY:
 - בעוד שעה=now+1h | בשעה X=today X | מחר X=tomorrow X
@@ -742,60 +757,45 @@ cron.schedule("30 6 * * *", async () => {
   }
 }, { timezone: "Asia/Jerusalem" });
 
-// 07:00 — morning brief (focus-first, analytical)
+// 07:00 — morning brief (strict 12-line template)
 cron.schedule("0 7 * * *", () => {
   sendScheduled(
-    "בריף בוקר — הרץ כלים במקביל (get_daily_focus, מזג אוויר, יומן היום, כל רשימות המשימות, מיילים). " +
-    "פורמט: (1) 🎯 פוקוס היום אם הוגדר. " +
-    "(2) מזג אוויר — שורה אחת. " +
-    "(3) Top 3 משימות לפי priority matrix (🔴 קודם) עם נימוק. " +
-    "(4) קונפליקטים ביומן + בדיקת בריאות: פגישות צמודות, חוסר הפסקת צהריים. " +
-    "(5) הצעת time-block לחלון הפנוי הראשון. " +
-    "(6) אם אין פוקוס מוגדר — סיים עם: 'מה 3 הדברים שחייבים לקרות היום?'"
+    "בריף בוקר. הרץ במקביל: get_daily_focus, מזג אוויר, יומן היום, get_tasks, מיילים. " +
+    "פלט לפי BRIEF TEMPLATE בדיוק — 12 שורות מקסימום. בלי טבלאות, בלי ---, בלי כותרות."
   );
 }, { timezone: "Asia/Jerusalem" });
 
-// 12:30 — midday stale-task + focus check
+// 12:30 — midday check (3 lines max)
 cron.schedule("30 12 * * *", () => {
   sendScheduled(
-    "צ'ק צהריים — הרץ get_daily_focus ו-get_tasks במקביל. " +
-    "ספק עדכון קצרצר: (1) סטטוס פוקוס: כמה מתוך 3 הושלמו עד עכשיו. " +
-    "(2) משימות תקועות (updated לפני 3+ ימים) — בחר את השתיים הכי חשובות ושאל ישירות: 'מה חוסם את X?' " +
-    "(3) אם הכל בשליטה — שורה אחת בלבד: '✅ הכל במסלול'. אל תציף."
+    "צ'ק צהריים. הרץ get_daily_focus + get_tasks. פלט 3 שורות מקסימום: " +
+    "🎯 X/3 | ⚠️ המשימה הכי תקועה + 'מה חוסם?' | אם הכל בסדר — רק '✅ במסלול. 🎯 X/3'."
   );
 }, { timezone: "Asia/Jerusalem" });
 
-// 22:00 — evening review (focus scorecard + reflection)
+// 22:00 — evening review (6 lines max)
 cron.schedule("0 22 * * *", () => {
   sendScheduled(
-    "סיכום ערב — הרץ get_daily_focus, get_tasks, get_productivity_stats במקביל. " +
-    "ספק: (1) 🎯 ציון פוקוס: X/3 הושלמו — אם פחות מ-3, מה נשאר ולמה? " +
-    "(2) מה הושלם היום בפועל (מהסטטיסטיקה). " +
-    "(3) Top 2 עדיפויות למחר עם נימוק. " +
-    "(4) שאלה: 'מה ההצלחה הכי גדולה של היום?'"
+    "סיכום ערב. הרץ get_daily_focus + get_productivity_stats. פלט 6 שורות מקסימום: " +
+    "🎯 ציון פוקוס X/3 | ✅ מה הושלם (שורה) | 📌 Top 2 למחר (2 שורות) | שאלה: מה ההצלחה של היום?"
   );
 }, { timezone: "Asia/Jerusalem" });
 
-// Sunday 08:00 — weekly planning session
+// Sunday 08:00 — weekly planning (10 lines max)
 cron.schedule("0 8 * * 0", () => {
   sendScheduled(
-    "תכנון שבועי (ראשון בבוקר) — הרץ get_productivity_stats, get_tasks (כל הרשימות), ויומן השבוע במקביל. " +
-    "ספק: (1) 📈 שבוע שעבר: כמה הושלמו לעומת השבוע הקודם — מגמה. " +
-    "(2) Backlog לפי domain — איפה הכי הרבה משימות פתוחות. " +
-    "(3) הצע Top 3 יעדים לשבוע — אחד לכל domain עמוס. " +
-    "(4) הצע 2-3 time-blocks ספציפיים בימים הקרובים לפי החלונות הפנויים ביומן. " +
-    "(5) סיים: 'מה היעד הכי חשוב של השבוע?'"
+    "תכנון שבוע. הרץ get_productivity_stats + get_tasks + יומן השבוע. פלט 10 שורות מקסימום: " +
+    "📈 velocity מול שבוע שעבר (שורה) | 🎯 3 יעדים לשבוע (3 שורות, לפי backlog) | " +
+    "🕐 2 time-blocks מוצעים (2 שורות) | שאלה: מה היעד הכי חשוב השבוע?"
   );
 }, { timezone: "Asia/Jerusalem" });
 
-// Friday 14:00 — weekly review (closing the week)
+// Friday 14:00 — weekly review (8 lines max)
 cron.schedule("0 14 * * 5", () => {
   sendScheduled(
-    "סקירה שבועית (סוף שבוע) — הרץ get_productivity_stats ו-get_tasks במקביל. " +
-    "ספק: (1) 📊 סיכום: X משימות הושלמו השבוע (לפי domain) — לעומת שבוע שעבר. " +
-    "(2) משימות שנגררות — ציין כל אחת ושאל מה חוסם. " +
-    "(3) מה לדחות רשמית לשבוע הבא ומה לבטל בכלל? " +
-    "(4) שאלה: 'מה הדבר הכי חשוב לסיים בשבוע הבא?'"
+    "סקירת שבוע. הרץ get_productivity_stats + get_tasks. פלט 8 שורות מקסימום: " +
+    "📊 הושלמו X מול שבוע שעבר (שורה) | ⚠️ 2 משימות הכי תקועות + מה חוסם (2 שורות) | " +
+    "🗑 מה לבטל/לדחות (שורה) | שאלה: מה לסיים בשבוע הבא?"
   );
 }, { timezone: "Asia/Jerusalem" });
 
@@ -852,8 +852,8 @@ bot.hears("📊 בריף", async (ctx) => {
   const stopTyping = keepTyping(ctx);
   try {
     const reply = await runAgent(ctx.chat.id,
-      "בריף מיידי — הרץ כלים במקביל (מזג אוויר, יומן היום, משימות, מיילים). " +
-      "ספק ניתוח: Top 3 עדיפויות עם נימוק, קונפליקטים, הצעת time-block, סיים בשאלה."
+      "בריף מיידי. הרץ במקביל: get_daily_focus, מזג אוויר, יומן היום, get_tasks, מיילים. " +
+      "פלט לפי BRIEF TEMPLATE בדיוק — 12 שורות מקסימום."
     );
     stopTyping();
     await safeSend(ctx.chat.id, reply);
@@ -865,9 +865,10 @@ bot.hears("✅ סקירה", async (ctx) => {
   const stopTyping = keepTyping(ctx);
   try {
     const reply = await runAgent(ctx.chat.id,
-      "סקירת משימות — הרץ get_tasks על כל הרשימות. " +
-      "ספק: (1) כמה משימות פתוחות לפי domain. (2) משימות ללא תאריך יעד — שאל 'מתי?' לכל אחת. " +
-      "(3) המשימה שנראית הכי תקועה — שאל 'מה חוסם?'. (4) הצעה קונקרטית אחת לפעולה עכשיו."
+      "סקירת משימות. הרץ get_tasks על כל הרשימות. פלט 8 שורות מקסימום: " +
+      "📋 פתוחות לפי domain — שורה אחת (למשל: דינמיקה 8 | SPINZ 5) | " +
+      "⚠️ 2 הכי תקועות + 'מה חוסם?' (2 שורות) | 📌 חסרות דדליין — מספר בלבד + הצעה לטפל | " +
+      "👉 פעולה אחת מומלצת עכשיו."
     );
     stopTyping();
     await safeSend(ctx.chat.id, reply);
@@ -902,8 +903,8 @@ bot.hears("📈 נתונים", async (ctx) => {
   const stopTyping = keepTyping(ctx);
   try {
     const reply = await runAgent(ctx.chat.id,
-      "הרץ get_productivity_stats. הצג: (1) כמה משימות הושלמו השבוע לעומת שבוע שעבר — עם אחוז שינוי. " +
-      "(2) פירוק לפי domain. (3) היום הכי פרודוקטיבי השבוע. (4) תובנה אחת קצרה — מה המגמה אומרת."
+      "הרץ get_productivity_stats. פלט 5 שורות מקסימום: " +
+      "📈 השבוע X מול Y שבוע שעבר (+Z%) | פירוק domain בשורה אחת | היום הכי חזק | תובנה אחת."
     );
     stopTyping();
     await safeSend(ctx.chat.id, reply);
@@ -1124,8 +1125,8 @@ bot.command("brief", async (ctx) => {
   try {
     const reply = await runAgent(
       ctx.chat.id,
-      "בריף מיידי — הרץ כלים במקביל (מזג אוויר, יומן היום, משימות, מיילים). " +
-      "ספק ניתוח: Top 3 עדיפויות עם נימוק, קונפליקטים, הצעת time-block, סיים בשאלה."
+      "בריף מיידי. הרץ במקביל: get_daily_focus, מזג אוויר, יומן היום, get_tasks, מיילים. " +
+      "פלט לפי BRIEF TEMPLATE בדיוק — 12 שורות מקסימום."
     );
     stopTyping();
     await safeSend(ctx.chat.id, reply);
@@ -1153,11 +1154,9 @@ bot.command("review", async (ctx) => {
   try {
     const reply = await runAgent(
       ctx.chat.id,
-      "סקירת משימות — הרץ get_tasks על כל הרשימות. " +
-      "אז ספק: (1) כמה משימות פתוחות לפי domain — היכן הכי הרבה backlog? " +
-      "(2) משימות ללא תאריך יעד — רשום אותן ושאל על כל אחת 'מתי?'. " +
-      "(3) המשימה שנראית הכי תקועה — שאל ישירות 'מה חוסם אותך?' " +
-      "(4) הצעה אחת קונקרטית: מה לעשות עכשיו כדי להתקדם הכי הרבה."
+      "סקירת משימות. הרץ get_tasks על כל הרשימות. פלט 8 שורות מקסימום: " +
+      "📋 פתוחות לפי domain בשורה אחת | ⚠️ 2 הכי תקועות + 'מה חוסם?' | " +
+      "📌 חסרות דדליין — מספר + הצעה | 👉 פעולה אחת מומלצת עכשיו."
     );
     stopTyping();
     await safeSend(ctx.chat.id, reply);
