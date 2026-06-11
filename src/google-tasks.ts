@@ -68,16 +68,15 @@ export async function addTask(
   const tasks = google.tasks({ version: "v1", auth });
 
   const lists = await getTaskLists();
-  // Default to "My Tasks" if no listName specified; fall back to first list
-  let list = lists.find((l) => l.title.toLowerCase() === "my tasks") ?? lists[0];
+  // NEVER auto-create lists — unknown listName falls back to "חיי בית" (catch-all), then first list.
+  const fallback = lists.find((l) => l.title.includes("חיי בית")) ?? lists[0];
+  let list = fallback;
   if (listName) {
     const found = lists.find((l) => l.title.toLowerCase().includes(listName.toLowerCase()));
     if (found) {
       list = found;
     } else {
-      // Create the list if it doesn't exist
-      const created = await tasks.tasklists.insert({ requestBody: { title: listName } });
-      list = { id: created.data.id ?? "", title: created.data.title ?? listName };
+      console.warn(`[tasks] list "${listName}" not found — falling back to "${fallback.title}" (auto-create disabled)`);
     }
   }
 

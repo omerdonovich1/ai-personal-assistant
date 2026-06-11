@@ -59,17 +59,15 @@ const DOMAIN_OPTIONS = [
   { label: "💼 דינמיקה",   list: "דינמיקה" },
   { label: "🏡 בית",       list: "חיי בית" },
   { label: "🏠 סולשיין",   list: "סולשיין" },
-  { label: "📋 כללי",      list: "My Tasks" },
 ];
 
 function domainKeyboard(): InlineKeyboard {
-  return new InlineKeyboard()
-    .text(DOMAIN_OPTIONS[0].label, `dom:${DOMAIN_OPTIONS[0].list}`)
-    .text(DOMAIN_OPTIONS[1].label, `dom:${DOMAIN_OPTIONS[1].list}`).row()
-    .text(DOMAIN_OPTIONS[2].label, `dom:${DOMAIN_OPTIONS[2].list}`)
-    .text(DOMAIN_OPTIONS[3].label, `dom:${DOMAIN_OPTIONS[3].list}`).row()
-    .text(DOMAIN_OPTIONS[4].label, `dom:${DOMAIN_OPTIONS[4].list}`)
-    .text(DOMAIN_OPTIONS[5].label, `dom:${DOMAIN_OPTIONS[5].list}`);
+  const kb = new InlineKeyboard();
+  DOMAIN_OPTIONS.forEach((d, i) => {
+    kb.text(d.label, `dom:${d.list}`);
+    if (i % 2 === 1) kb.row();
+  });
+  return kb;
 }
 
 function emailConfirmKeyboard(draftId: string): InlineKeyboard {
@@ -521,7 +519,7 @@ async function executeTool(name: string, input: Record<string, unknown>, chatId:
       }
       case "add_recurring_task":
         out = JSON.stringify(
-          await addRecurring(input.title as string, (input.listName as string) ?? "My Tasks", input.schedule as string), null, 2
+          await addRecurring(input.title as string, (input.listName as string) ?? "חיי בית", input.schedule as string), null, 2
         ); break;
       case "list_recurring_tasks": {
         const recs = await listRecurring();
@@ -605,7 +603,8 @@ Default location: בית חרות, ישראל.${contextSection}${factsSection}
 - 💼 דינמיקה/Tech: software, Carman S, Next.js, TypeScript, MCP, QC, fleet mgmt → list "דינמיקה"
 - 🏡 חיי בית: Jack Russell, Kia Picanto, Ninja Grill, cooking, fitness, personal → list "חיי בית"
 - 🏠 סולשיין: עומר/וירין/Sunshine → list "סולשיין"
-- No keyword → "${activeCtx?.taskList ?? "My Tasks"}"
+- No keyword → infer the best-fit domain from meaning; truly unclear → "${activeCtx?.taskList ?? "חיי בית"}"
+- ONLY these 5 lists exist. NEVER pass any other listName — auto-creating lists is disabled.
 
 ## DAILY FOCUS — the backbone of the day:
 - Today's focus = the 1-3 tasks that MUST happen today. Stored via set_daily_focus.
