@@ -47,9 +47,9 @@ const scheduledTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
 // ── UI: Reply Keyboard ────────────────────────────────────────────────────────
 
 const MAIN_KEYBOARD = new Keyboard()
-  .text("➕ משימה").text("📅 אירוע").text("⏰ תזכורת").row()
-  .text("🎯 פוקוס").text("📊 בריף").text("✅ סקירה").row()
-  .text("📧 מיילים").text("📈 נתונים")
+  .text("➕ משימה").text("📋 משימות").text("📅 אירוע").row()
+  .text("⏰ תזכורת").text("🎯 פוקוס").text("📊 בריף").row()
+  .text("✅ סקירה").text("📧 מיילים").text("📈 נתונים")
   .resized()
   .persistent();
 
@@ -95,6 +95,42 @@ const wizardStates = new Map<number, WizardState>();
 // Pending email drafts for inline-keyboard confirmation
 interface EmailDraft { to: string; subject: string; body: string }
 const emailDrafts = new Map<string, EmailDraft>();
+
+// ── Task browser (📋 משימות → pick → ✅ בוצע) ─────────────────────────────────
+// Cache per chat; inline callback_data carries only the array index (64-byte limit).
+
+interface CachedTask { id: string; listId: string; title: string; listTitle: string; due: string | null }
+const taskCache = new Map<number, CachedTask[]>();
+
+function isOverdue(due: string | null): boolean {
+  if (!due) return false;
+  const today = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  return due.slice(0, 10) < today;
+}
+
+function buildListsKeyboard(tasks: CachedTask[]): InlineKeyboard {
+  const counts = new Map<string, number>();
+  for (const t of tasks) counts.set(t.listTitle, (counts.get(t.listTitle) ?? 0) + 1);
+  const kb = new InlineKeyboard();
+  let i = 0;
+  for (const [list, count] of counts) {
+    kb.text(`${list} (${count})`, `tlist:${list.slice(0, 25)}`);
+    if (++i % 2 === 0) kb.row();
+  }
+  return kb;
+}
+
+function buildTasksKeyboard(chatId: number, listTitle: string): InlineKeyboard {
+  const tasks = taskCache.get(chatId) ?? [];
+  const kb = new InlineKeyboard();
+  tasks.forEach((t, idx) => {
+    if (!t.id || t.listTitle !== listTitle) return; // skip completed (blanked) slots
+    const marker = isOverdue(t.due) ? "🔺 " : "";
+    kb.text(`${marker}${t.title.slice(0, 38)}`, `tpick:${idx}`).row();
+  });
+  kb.text("🔙 לרשימות", "tlists");
+  return kb;
+}
 
 // ── Reminder scheduling ───────────────────────────────────────────────────────
 
@@ -909,6 +945,106 @@ bot.hears("📈 נתונים", async (ctx) => {
     stopTyping();
     await safeSend(ctx.chat.id, reply);
   } catch (err) { stopTyping(); await ctx.reply(`שגיאה: ${err instanceof Error ? err.message : String(err)}`); }
+});
+
+bot.hears("📋 משימות", async (ctx) => {
+  await ctx.replyWithChatAction("typing");
+  try {
+    const tasks = await getTasks();
+    const open = tasks.filter((t) => t.status === "needsAction");
+    if (open.length === 0) return ctx.reply("🎉 אין משימות פתוחות!");
+    const cached: CachedTask[] = open.map((t) => ({
+      id: t.id, listId: t.listId, title: t.title, listTitle: t.listTitle, due: t.due,
+    }));
+    taskCache.set(ctx.chat.id, cached);
+    const overdueCount = cached.filter((t) => isOverdue(t.due)).length;
+    const header = `📋 ${cached.length} משימות פתוחות${overdueCount ? ` (🔺 ${overdueCount} באיחור)` : ""}\nבחר רשימה:`;
+    await ctx.reply(header, { reply_markup: buildListsKeyboard(cached) });
+  } catch (err) {
+    await ctx.reply(`שגיאה: ${err instanceof Error ? err.message : String(err)}`);
+  }
+});
+
+// ── Task browser callbacks ────────────────────────────────────────────────────
+
+bot.callbackQuery("tlists", async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return ctx.answerCallbackQuery();
+  const cached = taskCache.get(chatId);
+  if (!cached || cached.length === 0) {
+    await ctx.answerCallbackQuery({ text: "הרשימה לא עדכנית — לחץ 📋 משימות" });
+    return;
+  }
+  await ctx.answerCallbackQuery();
+  await ctx.editMessageText(`📋 ${cached.length} משימות פתוחות\nבחר רשימה:`, {
+    reply_markup: buildListsKeyboard(cached),
+  });
+});
+
+bot.callbackQuery(/^tlist:(.+)$/, async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return ctx.answerCallbackQuery();
+  const listTitle = ctx.match[1];
+  const cached = taskCache.get(chatId);
+  if (!cached) {
+    await ctx.answerCallbackQuery({ text: "הרשימה לא עדכנית — לחץ 📋 משימות" });
+    return;
+  }
+  await ctx.answerCallbackQuery();
+  const full = cached.find((t) => t.listTitle.startsWith(listTitle))?.listTitle ?? listTitle;
+  await ctx.editMessageText(`📋 ${full} — בחר משימה:`, {
+    reply_markup: buildTasksKeyboard(chatId, full),
+  });
+});
+
+bot.callbackQuery(/^tpick:(\d+)$/, async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return ctx.answerCallbackQuery();
+  const idx = Number(ctx.match[1]);
+  const task = taskCache.get(chatId)?.[idx];
+  if (!task) {
+    await ctx.answerCallbackQuery({ text: "הרשימה לא עדכנית — לחץ 📋 משימות" });
+    return;
+  }
+  await ctx.answerCallbackQuery();
+  const dueLine = task.due
+    ? `\n📅 ${new Date(task.due).toLocaleDateString("he-IL", { timeZone: "Asia/Jerusalem" })}${isOverdue(task.due) ? " 🔺 באיחור" : ""}`
+    : "\n📅 ללא דדליין";
+  await ctx.editMessageText(`${task.title}\n📂 ${task.listTitle}${dueLine}`, {
+    reply_markup: new InlineKeyboard()
+      .text("✅ בוצע", `tdone:${idx}`)
+      .text("🔙 חזרה", `tlist:${task.listTitle.slice(0, 25)}`),
+  });
+});
+
+bot.callbackQuery(/^tdone:(\d+)$/, async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return ctx.answerCallbackQuery();
+  const idx = Number(ctx.match[1]);
+  const cached = taskCache.get(chatId);
+  const task = cached?.[idx];
+  if (!cached || !task) {
+    await ctx.answerCallbackQuery({ text: "הרשימה לא עדכנית — לחץ 📋 משימות" });
+    return;
+  }
+  await ctx.answerCallbackQuery({ text: "✅ בוצע!" });
+  try {
+    const done = await completeTask(task.id, task.listId);
+    await logCompletion(done.title, done.listTitle);
+    // Drop from cache (keep indexes stable by blanking the slot)
+    const listTitle = task.listTitle;
+    cached[idx] = { ...task, id: "", title: "" };
+    const remaining = cached.filter((t) => t.id && t.listTitle === listTitle);
+    if (remaining.length > 0) {
+      await ctx.editMessageText(`✅ הושלם: ${task.title}\n\n📋 ${listTitle} — עוד ${remaining.length}:`, {
+        reply_markup: buildTasksKeyboard(chatId, listTitle),
+      });
+    } else {
+      await ctx.editMessageText(`✅ הושלם: ${task.title}\n\n🎉 אין עוד משימות ב-${listTitle}!`);
+    }
+  } catch (err) {
+    await ctx.editMessageText(`❌ שגיאה בהשלמה: ${err instanceof Error ? err.message : String(err)}`);
+  }
 });
 
 // ── Inline keyboard callbacks ─────────────────────────────────────────────────
