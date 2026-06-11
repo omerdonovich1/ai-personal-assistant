@@ -488,11 +488,13 @@ Extract ALL entities (dates, amounts, names, tasks) → run tools in parallel �
       const text = response.content
         .filter((b): b is Anthropic.TextBlock => b.type === "text")
         .map((b) => b.text)
-        .join("\n");
+        .join("\n")
+        .trim();
 
-      history.push({ role: "assistant", content: text });
+      const reply = text || "✅";
+      history.push({ role: "assistant", content: reply });
       histories.set(chatId, history.slice(-20));
-      return text;
+      return reply;
     }
   }
 }
@@ -530,11 +532,12 @@ async function checkGoogleAuth(): Promise<boolean> {
 // ── Scheduled messages ────────────────────────────────────────────────────────
 
 async function safeSend(chatId: number, text: string): Promise<void> {
+  const safe = text?.trim();
+  if (!safe) return;
   try {
-    await bot.api.sendMessage(chatId, text, { parse_mode: "Markdown" });
+    await bot.api.sendMessage(chatId, safe, { parse_mode: "Markdown" });
   } catch {
-    // Fallback: plain text (handles unbalanced markdown characters)
-    await bot.api.sendMessage(chatId, text);
+    await bot.api.sendMessage(chatId, safe);
   }
 }
 
