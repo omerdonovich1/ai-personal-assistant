@@ -4,7 +4,7 @@ if (!globalThis.File) {
   const { File } = await import("node:buffer");
   (globalThis as unknown as Record<string, unknown>).File = File;
 }
-import { Bot } from "grammy";
+import { Bot, Keyboard, InlineKeyboard } from "grammy";
 import Anthropic from "@anthropic-ai/sdk";
 import Groq from "groq-sdk";
 import cron from "node-cron";
@@ -40,6 +40,57 @@ const groq = new Groq({ apiKey: GROQ_KEY });
 
 const histories = new Map<number, Anthropic.MessageParam[]>();
 const scheduledTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
+
+// ── UI: Reply Keyboard ────────────────────────────────────────────────────────
+
+const MAIN_KEYBOARD = new Keyboard()
+  .text("➕ משימה").text("📅 אירוע").text("⏰ תזכורת").row()
+  .text("📊 בריף").text("✅ סקירה").text("📧 מיילים")
+  .resized()
+  .persistent();
+
+const DOMAIN_OPTIONS = [
+  { label: "🚴 SPINZ",     list: "Spinz" },
+  { label: "💍 תכשיטים",   list: "תכשיטים" },
+  { label: "💼 דינמיקה",   list: "דינמיקה" },
+  { label: "🏡 בית",       list: "חיי בית" },
+  { label: "🏠 סולשיין",   list: "סולשיין" },
+  { label: "📋 כללי",      list: "My Tasks" },
+];
+
+function domainKeyboard(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text(DOMAIN_OPTIONS[0].label, `dom:${DOMAIN_OPTIONS[0].list}`)
+    .text(DOMAIN_OPTIONS[1].label, `dom:${DOMAIN_OPTIONS[1].list}`).row()
+    .text(DOMAIN_OPTIONS[2].label, `dom:${DOMAIN_OPTIONS[2].list}`)
+    .text(DOMAIN_OPTIONS[3].label, `dom:${DOMAIN_OPTIONS[3].list}`).row()
+    .text(DOMAIN_OPTIONS[4].label, `dom:${DOMAIN_OPTIONS[4].list}`)
+    .text(DOMAIN_OPTIONS[5].label, `dom:${DOMAIN_OPTIONS[5].list}`);
+}
+
+function emailConfirmKeyboard(draftId: string): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("✅ שלח", `email:send:${draftId}`)
+    .text("✏️ ערוך", `email:edit:${draftId}`)
+    .text("❌ בטל", `email:cancel:${draftId}`);
+}
+
+// ── Wizard state machine ──────────────────────────────────────────────────────
+
+type WizardState =
+  | { type: "task";     stage: "name" }
+  | { type: "task";     stage: "domain"; name: string }
+  | { type: "task";     stage: "due";    name: string; listName: string }
+  | { type: "event";    stage: "title" }
+  | { type: "event";    stage: "datetime"; title: string }
+  | { type: "reminder"; stage: "text" }
+  | { type: "reminder"; stage: "time";  text: string };
+
+const wizardStates = new Map<number, WizardState>();
+
+// Pending email drafts for inline-keyboard confirmation
+interface EmailDraft { to: string; subject: string; body: string }
+const emailDrafts = new Map<string, EmailDraft>();
 
 // ── Reminder scheduling ───────────────────────────────────────────────────────
 
@@ -624,16 +675,214 @@ bot.command("start", async (ctx) => {
   await saveChatId(ctx.chat.id);
   console.log("TELEGRAM_CHAT_ID =", ctx.chat.id);
   histories.delete(ctx.chat.id);
+  wizardStates.delete(ctx.chat.id);
   return ctx.reply(
-    "מוכן לפעולה.\n\n*תחומים:* 🚴 SPINZ | 💍 תכשיטים | 💼 דינמיקה | 🏡 בית | 🏠 סולשיין\n*כלים:* יומן · Gmail · Tasks · תזכורות · זיכרון · חיפוש · מזג אוויר · תמונות · קול\n\n_בריף יומי: 07:00 | סיכום ערב: 22:00_",
-    { parse_mode: "Markdown" }
+    "מוכן לפעולה.\n\n*תחומים:* 🚴 SPINZ | 💍 תכשיטים | 💼 דינמיקה | 🏡 בית | 🏠 סולשיין\n_בריף יומי: 07:00 | סיכום ערב: 22:00 | סקירה שבועית: שישי 14:00_",
+    { parse_mode: "Markdown", reply_markup: MAIN_KEYBOARD }
   );
 });
 
 bot.command("clear", (ctx) => {
   histories.delete(ctx.chat.id);
-  return ctx.reply("השיחה נוקתה ✅");
+  wizardStates.delete(ctx.chat.id);
+  return ctx.reply("השיחה נוקתה ✅", { reply_markup: MAIN_KEYBOARD });
 });
+
+// ── Keyboard button handlers ──────────────────────────────────────────────────
+
+bot.hears("➕ משימה", async (ctx) => {
+  wizardStates.set(ctx.chat.id, { type: "task", stage: "name" });
+  await ctx.reply("מה שם המשימה?");
+});
+
+bot.hears("📅 אירוע", async (ctx) => {
+  wizardStates.set(ctx.chat.id, { type: "event", stage: "title" });
+  await ctx.reply("מה שם האירוע?");
+});
+
+bot.hears("⏰ תזכורת", async (ctx) => {
+  wizardStates.set(ctx.chat.id, { type: "reminder", stage: "text" });
+  await ctx.reply("מה התזכורת?");
+});
+
+bot.hears("📊 בריף", async (ctx) => {
+  await ctx.replyWithChatAction("typing");
+  const stopTyping = keepTyping(ctx);
+  try {
+    const reply = await runAgent(ctx.chat.id,
+      "בריף מיידי — הרץ כלים במקביל (מזג אוויר, יומן היום, משימות, מיילים). " +
+      "ספק ניתוח: Top 3 עדיפויות עם נימוק, קונפליקטים, הצעת time-block, סיים בשאלה."
+    );
+    stopTyping();
+    await safeSend(ctx.chat.id, reply);
+  } catch (err) { stopTyping(); await ctx.reply(`שגיאה: ${err instanceof Error ? err.message : String(err)}`); }
+});
+
+bot.hears("✅ סקירה", async (ctx) => {
+  await ctx.replyWithChatAction("typing");
+  const stopTyping = keepTyping(ctx);
+  try {
+    const reply = await runAgent(ctx.chat.id,
+      "סקירת משימות — הרץ get_tasks על כל הרשימות. " +
+      "ספק: (1) כמה משימות פתוחות לפי domain. (2) משימות ללא תאריך יעד — שאל 'מתי?' לכל אחת. " +
+      "(3) המשימה שנראית הכי תקועה — שאל 'מה חוסם?'. (4) הצעה קונקרטית אחת לפעולה עכשיו."
+    );
+    stopTyping();
+    await safeSend(ctx.chat.id, reply);
+  } catch (err) { stopTyping(); await ctx.reply(`שגיאה: ${err instanceof Error ? err.message : String(err)}`); }
+});
+
+bot.hears("📧 מיילים", async (ctx) => {
+  await ctx.replyWithChatAction("typing");
+  const stopTyping = keepTyping(ctx);
+  try {
+    const reply = await runAgent(ctx.chat.id, "הראה לי את המיילים האחרונים הלא-נקראים. סכם כל אחד בשורה אחת.");
+    stopTyping();
+    await safeSend(ctx.chat.id, reply);
+  } catch (err) { stopTyping(); await ctx.reply(`שגיאה: ${err instanceof Error ? err.message : String(err)}`); }
+});
+
+// ── Inline keyboard callbacks ─────────────────────────────────────────────────
+
+bot.callbackQuery(/^dom:(.+)$/, async (ctx) => {
+  const listName = ctx.match[1];
+  const chatId = ctx.chat?.id;
+  if (!chatId) return ctx.answerCallbackQuery();
+  const state = wizardStates.get(chatId);
+  if (state?.type !== "task" || state.stage !== "domain") {
+    return ctx.answerCallbackQuery();
+  }
+  const domLabel = DOMAIN_OPTIONS.find(d => d.list === listName)?.label ?? listName;
+  await ctx.editMessageText(`${domLabel}`);
+  wizardStates.set(chatId, { type: "task", stage: "due", name: state.name, listName });
+  await ctx.answerCallbackQuery();
+  await ctx.reply(
+    "מתי לסיים? (לדוגמה: מחר, יום ד', 15/7)\nאפשר לדלג:",
+    { reply_markup: new InlineKeyboard().text("⏭ ללא תאריך", "skip:due") }
+  );
+});
+
+bot.callbackQuery("skip:due", async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return ctx.answerCallbackQuery();
+  const state = wizardStates.get(chatId);
+  if (state?.type !== "task" || state.stage !== "due") return ctx.answerCallbackQuery();
+  await ctx.editMessageText("ללא תאריך יעד");
+  await ctx.answerCallbackQuery();
+  wizardStates.delete(chatId);
+  await doAddTask(chatId, state.name, state.listName, undefined);
+});
+
+bot.callbackQuery(/^email:(send|cancel|edit):(.+)$/, async (ctx) => {
+  const action = ctx.match[1];
+  const draftId = ctx.match[2];
+  const draft = emailDrafts.get(draftId);
+  await ctx.answerCallbackQuery();
+  if (!draft) { await ctx.editMessageText("הטיוטה כבר לא זמינה."); return; }
+
+  if (action === "cancel") {
+    emailDrafts.delete(draftId);
+    await ctx.editMessageText("❌ המייל בוטל.");
+    return;
+  }
+  if (action === "edit") {
+    emailDrafts.delete(draftId);
+    await ctx.editMessageText("✏️ מה לשנות במייל?");
+    return;
+  }
+  if (action === "send") {
+    emailDrafts.delete(draftId);
+    await ctx.editMessageText("⏳ שולח...");
+    try {
+      await sendEmail(draft.to, draft.subject, draft.body);
+      // Auto follow-up reminder (48h)
+      const followUpAt = new Date(Date.now() + 48 * 60 * 60 * 1000);
+      const fid = `followup_${Date.now()}`;
+      const fr: Reminder = { id: fid, chatId: ctx.chat?.id ?? 0, text: `מעקב: מייל לא ענה — ${draft.to} | "${draft.subject}"`, fireAt: followUpAt.toISOString() };
+      await upsertReminder(fr); scheduleReminder(fr);
+      await ctx.editMessageText(`✅ נשלח אל ${draft.to}\n_תזכורת מעקב: ${followUpAt.toLocaleString("he-IL", { timeZone: "Asia/Jerusalem" })}_`, { parse_mode: "Markdown" });
+    } catch (err) {
+      await ctx.editMessageText(`❌ שגיאה בשליחה: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+});
+
+// ── Wizard: handle text input during active wizard ─────────────────────────────
+
+async function doAddTask(chatId: number, name: string, listName: string, dueText: string | undefined): Promise<void> {
+  try {
+    let dueIso: string | undefined;
+    if (dueText) {
+      const result = await runAgent(chatId, `המר את התאריך "${dueText}" ל-ISO 8601 עם +03:00. החזר רק את המחרוזת, ללא הסברים.`);
+      const match = result.match(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}/);
+      dueIso = match ? match[0] : undefined;
+    }
+    const task = await addTask(name, listName, dueIso);
+    const dueStr = dueIso ? ` | 📅 ${new Date(dueIso).toLocaleDateString("he-IL", { timeZone: "Asia/Jerusalem" })}` : "";
+    const domLabel = DOMAIN_OPTIONS.find(d => d.list === listName)?.label ?? listName;
+    await bot.api.sendMessage(chatId,
+      `✅ נוסף: *${task.title}*\n${domLabel}${dueStr}\n\nמה הדדליין הסופי? כמה זמן לוקח לך?`,
+      { parse_mode: "Markdown", reply_markup: MAIN_KEYBOARD }
+    );
+  } catch (err) {
+    await bot.api.sendMessage(chatId, `❌ שגיאה: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+async function handleWizard(chatId: number, text: string, state: WizardState): Promise<void> {
+  if (state.type === "task") {
+    if (state.stage === "name") {
+      wizardStates.set(chatId, { type: "task", stage: "domain", name: text });
+      await bot.api.sendMessage(chatId, `*"${text}"*\n\nלאיזה תחום?`, {
+        parse_mode: "Markdown",
+        reply_markup: domainKeyboard(),
+      });
+      return;
+    }
+    if (state.stage === "due") {
+      wizardStates.delete(chatId);
+      await doAddTask(chatId, state.name, state.listName, text);
+      return;
+    }
+  }
+
+  if (state.type === "event") {
+    if (state.stage === "title") {
+      wizardStates.set(chatId, { type: "event", stage: "datetime", title: text });
+      await bot.api.sendMessage(chatId, `*"${text}"*\n\nמתי ובאיזו שעה?\n(לדוגמה: מחר בשעה 14:00, יום ד' 15/7 10:00–11:00)`, { parse_mode: "Markdown" });
+      return;
+    }
+    if (state.stage === "datetime") {
+      wizardStates.delete(chatId);
+      await bot.api.sendMessage(chatId, "⏳ מוסיף ליומן...");
+      try {
+        const reply = await runAgent(chatId, `הוסף אירוע ביומן: "${state.title}" — ${text}. השתמש ב-add_calendar_event.`);
+        await safeSend(chatId, reply);
+      } catch (err) {
+        await bot.api.sendMessage(chatId, `❌ שגיאה: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      return;
+    }
+  }
+
+  if (state.type === "reminder") {
+    if (state.stage === "text") {
+      wizardStates.set(chatId, { type: "reminder", stage: "time", text });
+      await bot.api.sendMessage(chatId, `*"${text}"*\n\nמתי לתזכר?\n(לדוגמה: בעוד שעה, מחר ב-9:00, יום ד' בשעה 15:00)`, { parse_mode: "Markdown" });
+      return;
+    }
+    if (state.stage === "time") {
+      wizardStates.delete(chatId);
+      try {
+        const reply = await runAgent(chatId, `קבע תזכורת: "${state.text}" — ${text}. השתמש ב-set_reminder.`);
+        await safeSend(chatId, reply);
+      } catch (err) {
+        await bot.api.sendMessage(chatId, `❌ שגיאה: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      return;
+    }
+  }
+}
 
 bot.command("ctx", async (ctx) => {
   const arg = ctx.match?.trim();
@@ -865,6 +1114,14 @@ bot.on("message:text", async (ctx) => {
   const chatId = ctx.chat.id;
   const text = ctx.message.text;
   console.log(`[msg] chatId=${chatId} text="${text.slice(0, 80)}"`);
+
+  // Wizard flow takes priority (skip commands)
+  const wizState = wizardStates.get(chatId);
+  if (wizState && !text.startsWith("/")) {
+    await ctx.replyWithChatAction("typing");
+    await handleWizard(chatId, text, wizState);
+    return;
+  }
 
   await ctx.replyWithChatAction("typing");
   const stopTyping = keepTyping(ctx);
