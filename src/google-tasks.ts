@@ -119,3 +119,55 @@ export async function completeTask(taskId: string, listId: string): Promise<{ ti
     listTitle: lists.find((l) => l.id === listId)?.title ?? listId,
   };
 }
+
+// ── List & task management ──────────────────────────────────────────────────
+
+export async function createTaskList(title: string): Promise<TaskList> {
+  const auth = await getAuthClient();
+  const tasks = google.tasks({ version: "v1", auth });
+  const res = await tasks.tasklists.insert({ requestBody: { title } });
+  return { id: res.data.id ?? "", title: res.data.title ?? title };
+}
+
+export async function deleteTaskList(listId: string): Promise<void> {
+  const auth = await getAuthClient();
+  const tasks = google.tasks({ version: "v1", auth });
+  await tasks.tasklists.delete({ tasklist: listId });
+}
+
+export async function deleteTask(taskId: string, listId: string): Promise<void> {
+  const auth = await getAuthClient();
+  const tasks = google.tasks({ version: "v1", auth });
+  await tasks.tasks.delete({ tasklist: listId, task: taskId });
+}
+
+/** Move a task to another list (Google has no cross-list move — re-create then delete). */
+export async function moveTask(
+  taskId: string,
+  fromListId: string,
+  toListId: string
+): Promise<Task> {
+  const auth = await getAuthClient();
+  const tasks = google.tasks({ version: "v1", auth });
+
+  const orig = await tasks.tasks.get({ tasklist: fromListId, task: taskId });
+  const body: { title: string; notes?: string; due?: string } = { title: orig.data.title ?? "" };
+  if (orig.data.notes) body.notes = orig.data.notes;
+  if (orig.data.due) body.due = orig.data.due;
+
+  const created = await tasks.tasks.insert({ tasklist: toListId, requestBody: body });
+  await tasks.tasks.delete({ tasklist: fromListId, task: taskId });
+
+  const lists = await getTaskLists();
+  const t = created.data;
+  return {
+    id: t.id ?? "",
+    title: t.title ?? "",
+    due: t.due ?? null,
+    notes: t.notes ?? null,
+    status: "needsAction",
+    listId: toListId,
+    listTitle: lists.find((l) => l.id === toListId)?.title ?? toListId,
+    updated: t.updated ?? null,
+  };
+}

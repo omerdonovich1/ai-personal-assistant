@@ -4,7 +4,7 @@ if (!globalThis.File) {
   const { File } = await import("node:buffer");
   (globalThis as unknown as Record<string, unknown>).File = File;
 }
-import { Bot, Keyboard, InlineKeyboard } from "grammy";
+import { Bot, Keyboard, InlineKeyboard, type Context } from "grammy";
 import Anthropic from "@anthropic-ai/sdk";
 import Groq from "groq-sdk";
 import cron from "node-cron";
@@ -15,7 +15,7 @@ import { tmpdir } from "os";
 import { pipeline } from "stream/promises";
 import { fileURLToPath } from "url";
 import { dirname } from "path";
-import { getTasks, addTask, completeTask, getTaskLists } from "./google-tasks.js";
+import { getTasks, addTask, completeTask, getTaskLists, createTaskList, deleteTaskList, deleteTask, moveTask } from "./google-tasks.js";
 import { getCalendarEvents, quickAddCalendarEvent, addCalendarEvent } from "./google-calendar.js";
 import { getUnreadEmails, sendEmail } from "./google-gmail.js";
 import { loadReminders, upsertReminder, deleteReminder, type Reminder } from "./reminder-store.js";
@@ -86,7 +86,8 @@ type WizardState =
   | { type: "event";    stage: "title" }
   | { type: "event";    stage: "datetime"; title: string }
   | { type: "reminder"; stage: "text" }
-  | { type: "reminder"; stage: "time";  text: string };
+  | { type: "reminder"; stage: "time";  text: string }
+  | { type: "newlist";  stage: "name" };
 
 const wizardStates = new Map<number, WizardState>();
 
@@ -94,10 +95,13 @@ const wizardStates = new Map<number, WizardState>();
 interface EmailDraft { to: string; subject: string; body: string }
 const emailDrafts = new Map<string, EmailDraft>();
 
-// ── Task browser (📋 משימות → pick → ✅ בוצע) ─────────────────────────────────
-// Cache per chat; inline callback_data carries only the array index (64-byte limit).
+// ── Task browser & manager (📋 משימות) ────────────────────────────────────────
+// Per-chat caches keyed by array INDEX — callback_data carries only the index
+// (64-byte limit), which also sidesteps duplicate list-name collisions.
 
+interface CachedList { id: string; title: string }
 interface CachedTask { id: string; listId: string; title: string; listTitle: string; due: string | null }
+const listCache = new Map<number, CachedList[]>();
 const taskCache = new Map<number, CachedTask[]>();
 
 function isOverdue(due: string | null): boolean {
@@ -106,28 +110,49 @@ function isOverdue(due: string | null): boolean {
   return due.slice(0, 10) < today;
 }
 
-function buildListsKeyboard(tasks: CachedTask[]): InlineKeyboard {
-  const counts = new Map<string, number>();
-  for (const t of tasks) counts.set(t.listTitle, (counts.get(t.listTitle) ?? 0) + 1);
+/** Refresh both caches from Google. */
+async function refreshTaskCache(chatId: number): Promise<void> {
+  const [lists, tasks] = await Promise.all([getTaskLists(), getTasks()]);
+  listCache.set(chatId, lists.map((l) => ({ id: l.id, title: l.title })));
+  taskCache.set(
+    chatId,
+    tasks
+      .filter((t) => t.status === "needsAction")
+      .map((t) => ({ id: t.id, listId: t.listId, title: t.title, listTitle: t.listTitle, due: t.due }))
+  );
+}
+
+function buildListsKeyboard(chatId: number): InlineKeyboard {
+  const lists = listCache.get(chatId) ?? [];
+  const tasks = taskCache.get(chatId) ?? [];
   const kb = new InlineKeyboard();
-  let i = 0;
-  for (const [list, count] of counts) {
-    kb.text(`${list} (${count})`, `tlist:${list.slice(0, 25)}`);
-    if (++i % 2 === 0) kb.row();
-  }
+  lists.forEach((l, idx) => {
+    const count = tasks.filter((t) => t.id && t.listId === l.id).length;
+    kb.text(`${l.title} (${count})`, `tlist:${idx}`);
+    if (idx % 2 === 1) kb.row();
+  });
+  kb.row().text("➕ רשימה חדשה", "lnew").text("⚙️ נהל רשימות", "lmanage");
   return kb;
 }
 
-function buildTasksKeyboard(chatId: number, listTitle: string): InlineKeyboard {
+function buildTasksKeyboard(chatId: number, listIdx: number): InlineKeyboard {
+  const list = (listCache.get(chatId) ?? [])[listIdx];
   const tasks = taskCache.get(chatId) ?? [];
   const kb = new InlineKeyboard();
-  tasks.forEach((t, idx) => {
-    if (!t.id || t.listTitle !== listTitle) return; // skip completed (blanked) slots
-    const marker = isOverdue(t.due) ? "🔺 " : "";
-    kb.text(`${marker}${t.title.slice(0, 38)}`, `tpick:${idx}`).row();
-  });
+  if (list) {
+    tasks.forEach((t, idx) => {
+      if (!t.id || t.listId !== list.id) return; // skip removed (blanked) slots
+      const marker = isOverdue(t.due) ? "🔺 " : "";
+      kb.text(`${marker}${t.title.slice(0, 38)}`, `tpick:${idx}`).row();
+    });
+  }
   kb.text("🔙 לרשימות", "tlists");
   return kb;
+}
+
+/** Find which cached list index a task belongs to. */
+function listIdxOfTask(chatId: number, task: CachedTask): number {
+  return (listCache.get(chatId) ?? []).findIndex((l) => l.id === task.listId);
 }
 
 // ── Reminder scheduling ───────────────────────────────────────────────────────
@@ -949,16 +974,11 @@ bot.hears("📈 נתונים", async (ctx) => {
 bot.hears("📋 משימות", async (ctx) => {
   await ctx.replyWithChatAction("typing");
   try {
-    const tasks = await getTasks();
-    const open = tasks.filter((t) => t.status === "needsAction");
-    if (open.length === 0) return ctx.reply("🎉 אין משימות פתוחות!");
-    const cached: CachedTask[] = open.map((t) => ({
-      id: t.id, listId: t.listId, title: t.title, listTitle: t.listTitle, due: t.due,
-    }));
-    taskCache.set(ctx.chat.id, cached);
-    const overdueCount = cached.filter((t) => isOverdue(t.due)).length;
-    const header = `📋 ${cached.length} משימות פתוחות${overdueCount ? ` (🔺 ${overdueCount} באיחור)` : ""}\nבחר רשימה:`;
-    await ctx.reply(header, { reply_markup: buildListsKeyboard(cached) });
+    await refreshTaskCache(ctx.chat.id);
+    const tasks = taskCache.get(ctx.chat.id) ?? [];
+    const overdueCount = tasks.filter((t) => isOverdue(t.due)).length;
+    const header = `📋 ${tasks.length} משימות פתוחות${overdueCount ? ` (🔺 ${overdueCount} באיחור)` : ""}\nבחר רשימה:`;
+    await ctx.reply(header, { reply_markup: buildListsKeyboard(ctx.chat.id) });
   } catch (err) {
     await ctx.reply(`שגיאה: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -966,34 +986,29 @@ bot.hears("📋 משימות", async (ctx) => {
 
 // ── Task browser callbacks ────────────────────────────────────────────────────
 
+const STALE = "הרשימה לא עדכנית — לחץ 📋 משימות";
+
 bot.callbackQuery("tlists", async (ctx) => {
   const chatId = ctx.chat?.id;
   if (!chatId) return ctx.answerCallbackQuery();
-  const cached = taskCache.get(chatId);
-  if (!cached || cached.length === 0) {
-    await ctx.answerCallbackQuery({ text: "הרשימה לא עדכנית — לחץ 📋 משימות" });
-    return;
-  }
+  const tasks = taskCache.get(chatId);
+  if (!tasks) { await ctx.answerCallbackQuery({ text: STALE }); return; }
   await ctx.answerCallbackQuery();
-  await ctx.editMessageText(`📋 ${cached.length} משימות פתוחות\nבחר רשימה:`, {
-    reply_markup: buildListsKeyboard(cached),
+  await ctx.editMessageText(`📋 ${tasks.filter((t) => t.id).length} משימות פתוחות\nבחר רשימה:`, {
+    reply_markup: buildListsKeyboard(chatId),
   });
 });
 
-bot.callbackQuery(/^tlist:(.+)$/, async (ctx) => {
+bot.callbackQuery(/^tlist:(\d+)$/, async (ctx) => {
   const chatId = ctx.chat?.id;
   if (!chatId) return ctx.answerCallbackQuery();
-  const listTitle = ctx.match[1];
-  const cached = taskCache.get(chatId);
-  if (!cached) {
-    await ctx.answerCallbackQuery({ text: "הרשימה לא עדכנית — לחץ 📋 משימות" });
-    return;
-  }
+  const listIdx = Number(ctx.match[1]);
+  const list = (listCache.get(chatId) ?? [])[listIdx];
+  if (!list) { await ctx.answerCallbackQuery({ text: STALE }); return; }
   await ctx.answerCallbackQuery();
-  const full = cached.find((t) => t.listTitle.startsWith(listTitle))?.listTitle ?? listTitle;
-  await ctx.editMessageText(`📋 ${full} — בחר משימה:`, {
-    reply_markup: buildTasksKeyboard(chatId, full),
-  });
+  const count = (taskCache.get(chatId) ?? []).filter((t) => t.id && t.listId === list.id).length;
+  const body = count > 0 ? `📂 ${list.title} — בחר משימה:` : `📂 ${list.title}\n\n🎉 ריקה.`;
+  await ctx.editMessageText(body, { reply_markup: buildTasksKeyboard(chatId, listIdx) });
 });
 
 bot.callbackQuery(/^tpick:(\d+)$/, async (ctx) => {
@@ -1001,20 +1016,35 @@ bot.callbackQuery(/^tpick:(\d+)$/, async (ctx) => {
   if (!chatId) return ctx.answerCallbackQuery();
   const idx = Number(ctx.match[1]);
   const task = taskCache.get(chatId)?.[idx];
-  if (!task) {
-    await ctx.answerCallbackQuery({ text: "הרשימה לא עדכנית — לחץ 📋 משימות" });
-    return;
-  }
+  if (!task || !task.id) { await ctx.answerCallbackQuery({ text: STALE }); return; }
   await ctx.answerCallbackQuery();
+  const listIdx = listIdxOfTask(chatId, task);
   const dueLine = task.due
     ? `\n📅 ${new Date(task.due).toLocaleDateString("he-IL", { timeZone: "Asia/Jerusalem" })}${isOverdue(task.due) ? " 🔺 באיחור" : ""}`
     : "\n📅 ללא דדליין";
   await ctx.editMessageText(`${task.title}\n📂 ${task.listTitle}${dueLine}`, {
     reply_markup: new InlineKeyboard()
-      .text("✅ בוצע", `tdone:${idx}`)
-      .text("🔙 חזרה", `tlist:${task.listTitle.slice(0, 25)}`),
+      .text("✅ בוצע", `tdone:${idx}`).text("🗑 מחק", `tdel:${idx}`).row()
+      .text("📂 העבר", `tmove:${idx}`).text("🔙 חזרה", `tlist:${listIdx}`),
   });
 });
+
+/** Re-render a list's tasks after a task left it (complete/delete/move). */
+async function rerenderAfterRemoval(ctx: Context, chatId: number, listId: string, prefix: string): Promise<void> {
+  const lists = listCache.get(chatId) ?? [];
+  const listIdx = lists.findIndex((l) => l.id === listId);
+  const listTitle = lists[listIdx]?.title ?? "";
+  const remaining = (taskCache.get(chatId) ?? []).filter((t) => t.id && t.listId === listId);
+  if (remaining.length > 0) {
+    await ctx.editMessageText(`${prefix}\n\n📂 ${listTitle} — עוד ${remaining.length}:`, {
+      reply_markup: buildTasksKeyboard(chatId, listIdx),
+    });
+  } else {
+    await ctx.editMessageText(`${prefix}\n\n🎉 אין עוד משימות ב-${listTitle}!`, {
+      reply_markup: new InlineKeyboard().text("🔙 לרשימות", "tlists"),
+    });
+  }
+}
 
 bot.callbackQuery(/^tdone:(\d+)$/, async (ctx) => {
   const chatId = ctx.chat?.id;
@@ -1022,27 +1052,145 @@ bot.callbackQuery(/^tdone:(\d+)$/, async (ctx) => {
   const idx = Number(ctx.match[1]);
   const cached = taskCache.get(chatId);
   const task = cached?.[idx];
-  if (!cached || !task) {
-    await ctx.answerCallbackQuery({ text: "הרשימה לא עדכנית — לחץ 📋 משימות" });
-    return;
-  }
+  if (!cached || !task || !task.id) { await ctx.answerCallbackQuery({ text: STALE }); return; }
   await ctx.answerCallbackQuery({ text: "✅ בוצע!" });
   try {
     const done = await completeTask(task.id, task.listId);
     await logCompletion(done.title, done.listTitle);
-    // Drop from cache (keep indexes stable by blanking the slot)
-    const listTitle = task.listTitle;
+    const listId = task.listId;
     cached[idx] = { ...task, id: "", title: "" };
-    const remaining = cached.filter((t) => t.id && t.listTitle === listTitle);
-    if (remaining.length > 0) {
-      await ctx.editMessageText(`✅ הושלם: ${task.title}\n\n📋 ${listTitle} — עוד ${remaining.length}:`, {
-        reply_markup: buildTasksKeyboard(chatId, listTitle),
-      });
-    } else {
-      await ctx.editMessageText(`✅ הושלם: ${task.title}\n\n🎉 אין עוד משימות ב-${listTitle}!`);
-    }
+    await rerenderAfterRemoval(ctx, chatId, listId, `✅ הושלם: ${task.title}`);
   } catch (err) {
-    await ctx.editMessageText(`❌ שגיאה בהשלמה: ${err instanceof Error ? err.message : String(err)}`);
+    await ctx.editMessageText(`❌ שגיאה: ${err instanceof Error ? err.message : String(err)}`);
+  }
+});
+
+bot.callbackQuery(/^tdel:(\d+)$/, async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return ctx.answerCallbackQuery();
+  const idx = Number(ctx.match[1]);
+  const task = taskCache.get(chatId)?.[idx];
+  if (!task || !task.id) { await ctx.answerCallbackQuery({ text: STALE }); return; }
+  await ctx.answerCallbackQuery();
+  await ctx.editMessageText(`🗑 למחוק לצמיתות?\n\n${task.title}\n📂 ${task.listTitle}`, {
+    reply_markup: new InlineKeyboard()
+      .text("🗑 כן, מחק", `tdelyes:${idx}`).text("↩️ ביטול", `tpick:${idx}`),
+  });
+});
+
+bot.callbackQuery(/^tdelyes:(\d+)$/, async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return ctx.answerCallbackQuery();
+  const idx = Number(ctx.match[1]);
+  const cached = taskCache.get(chatId);
+  const task = cached?.[idx];
+  if (!cached || !task || !task.id) { await ctx.answerCallbackQuery({ text: STALE }); return; }
+  await ctx.answerCallbackQuery({ text: "🗑 נמחק" });
+  try {
+    await deleteTask(task.id, task.listId);
+    const listId = task.listId;
+    cached[idx] = { ...task, id: "", title: "" };
+    await rerenderAfterRemoval(ctx, chatId, listId, `🗑 נמחק: ${task.title}`);
+  } catch (err) {
+    await ctx.editMessageText(`❌ שגיאה: ${err instanceof Error ? err.message : String(err)}`);
+  }
+});
+
+bot.callbackQuery(/^tmove:(\d+)$/, async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return ctx.answerCallbackQuery();
+  const idx = Number(ctx.match[1]);
+  const task = taskCache.get(chatId)?.[idx];
+  if (!task || !task.id) { await ctx.answerCallbackQuery({ text: STALE }); return; }
+  await ctx.answerCallbackQuery();
+  const lists = listCache.get(chatId) ?? [];
+  const kb = new InlineKeyboard();
+  lists.forEach((l, lIdx) => {
+    if (l.id === task.listId) return; // skip current list
+    kb.text(l.title, `tmoveto:${idx}:${lIdx}`);
+    if (kb.inline_keyboard[kb.inline_keyboard.length - 1].length === 2) kb.row();
+  });
+  kb.row().text("↩️ ביטול", `tpick:${idx}`);
+  await ctx.editMessageText(`📂 העבר את "${task.title}" לאן?`, { reply_markup: kb });
+});
+
+bot.callbackQuery(/^tmoveto:(\d+):(\d+)$/, async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return ctx.answerCallbackQuery();
+  const idx = Number(ctx.match[1]);
+  const targetIdx = Number(ctx.match[2]);
+  const cached = taskCache.get(chatId);
+  const task = cached?.[idx];
+  const target = (listCache.get(chatId) ?? [])[targetIdx];
+  if (!cached || !task || !task.id || !target) { await ctx.answerCallbackQuery({ text: STALE }); return; }
+  await ctx.answerCallbackQuery({ text: `📂 → ${target.title}` });
+  try {
+    const sourceId = task.listId;
+    const moved = await moveTask(task.id, task.listId, target.id);
+    // Update cache: blank old slot, append moved task as a new slot
+    cached[idx] = { ...task, id: "", title: "" };
+    cached.push({ id: moved.id, listId: target.id, title: moved.title, listTitle: target.title, due: moved.due });
+    await rerenderAfterRemoval(ctx, chatId, sourceId, `📂 "${task.title}" → ${target.title}`);
+  } catch (err) {
+    await ctx.editMessageText(`❌ שגיאה: ${err instanceof Error ? err.message : String(err)}`);
+  }
+});
+
+// ── List management callbacks ─────────────────────────────────────────────────
+
+bot.callbackQuery("lnew", async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return ctx.answerCallbackQuery();
+  await ctx.answerCallbackQuery();
+  wizardStates.set(chatId, { type: "newlist", stage: "name" });
+  await ctx.reply("מה שם הרשימה החדשה?");
+});
+
+bot.callbackQuery("lmanage", async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return ctx.answerCallbackQuery();
+  const lists = listCache.get(chatId);
+  if (!lists) { await ctx.answerCallbackQuery({ text: STALE }); return; }
+  await ctx.answerCallbackQuery();
+  const kb = new InlineKeyboard();
+  const tasks = taskCache.get(chatId) ?? [];
+  lists.forEach((l, idx) => {
+    const count = tasks.filter((t) => t.id && t.listId === l.id).length;
+    kb.text(`🗑 ${l.title} (${count})`, `ldel:${idx}`).row();
+  });
+  kb.text("🔙 לרשימות", "tlists");
+  await ctx.editMessageText("⚙️ מחיקת רשימות — בחר רשימה למחיקה:\n⚠️ מחיקת רשימה מוחקת גם את כל המשימות שבה.", { reply_markup: kb });
+});
+
+bot.callbackQuery(/^ldel:(\d+)$/, async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return ctx.answerCallbackQuery();
+  const idx = Number(ctx.match[1]);
+  const list = (listCache.get(chatId) ?? [])[idx];
+  if (!list) { await ctx.answerCallbackQuery({ text: STALE }); return; }
+  await ctx.answerCallbackQuery();
+  const count = (taskCache.get(chatId) ?? []).filter((t) => t.id && t.listId === list.id).length;
+  await ctx.editMessageText(
+    `🗑 למחוק את הרשימה "${list.title}"?${count ? `\n⚠️ ${count} משימות פתוחות יימחקו איתה!` : ""}`,
+    { reply_markup: new InlineKeyboard().text("🗑 כן, מחק", `ldelyes:${idx}`).text("↩️ ביטול", "lmanage") }
+  );
+});
+
+bot.callbackQuery(/^ldelyes:(\d+)$/, async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return ctx.answerCallbackQuery();
+  const idx = Number(ctx.match[1]);
+  const list = (listCache.get(chatId) ?? [])[idx];
+  if (!list) { await ctx.answerCallbackQuery({ text: STALE }); return; }
+  await ctx.answerCallbackQuery({ text: "🗑 נמחק" });
+  try {
+    await deleteTaskList(list.id);
+    await refreshTaskCache(chatId);
+    await ctx.editMessageText(`🗑 הרשימה "${list.title}" נמחקה.`, {
+      reply_markup: new InlineKeyboard().text("🔙 לרשימות", "tlists"),
+    });
+  } catch (err) {
+    await ctx.editMessageText(`❌ שגיאה: ${err instanceof Error ? err.message : String(err)}`);
   }
 });
 
@@ -1185,6 +1333,20 @@ async function handleWizard(chatId: number, text: string, state: WizardState): P
       }
       return;
     }
+  }
+
+  if (state.type === "newlist") {
+    wizardStates.delete(chatId);
+    const name = text.trim();
+    if (!name) { await bot.api.sendMessage(chatId, "שם ריק — בוטל."); return; }
+    try {
+      await createTaskList(name);
+      await refreshTaskCache(chatId);
+      await bot.api.sendMessage(chatId, `✅ נוצרה רשימה: ${name}\n\nלחץ 📋 משימות כדי לפתוח אותה.`, { reply_markup: MAIN_KEYBOARD });
+    } catch (err) {
+      await bot.api.sendMessage(chatId, `❌ שגיאה ביצירת רשימה: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return;
   }
 }
 
