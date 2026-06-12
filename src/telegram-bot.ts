@@ -27,6 +27,8 @@ import { modelFor, type ModelTier } from "./llm.js";
 import { routeMessage } from "./router.js";
 import { initMcp, getMcpTools, isMcpTool, executeMcpTool } from "./mcp-client.js";
 import { rememberContext, recallContext, seedFromFacts } from "./vector-memory.js";
+import { githubConfigured, githubOpenIssues, githubCreateIssue, githubCloseIssue } from "./services/github.js";
+import { shopifyConfigured, shopifySummary } from "./services/shopify.js";
 import { getTodayFocus, setTodayFocus, markFocusDone, formatFocus } from "./focus-store.js";
 import { logCompletion, getWeekStats } from "./stats-store.js";
 import { listRecurring, addRecurring, deleteRecurring, popDueToday, describeSchedule } from "./recurring-store.js";
@@ -473,6 +475,44 @@ const TOOLS: Anthropic.Tool[] = [
       required: ["query"],
     },
   },
+  {
+    name: "github_issues",
+    description: "List open GitHub issues across tracked repos (or one repo). Use for dev status, 'מה פתוח בגיטהאב', and in briefs when GitHub is configured.",
+    input_schema: {
+      type: "object",
+      properties: { repo: { type: "string", description: "Optional 'owner/repo' filter." } },
+    },
+  },
+  {
+    name: "github_create_issue",
+    description: "Open a new GitHub issue. Use when the user reports a bug/feature for one of their repos.",
+    input_schema: {
+      type: "object",
+      properties: {
+        repo: { type: "string", description: "'owner/repo'." },
+        title: { type: "string" },
+        body: { type: "string" },
+      },
+      required: ["repo", "title"],
+    },
+  },
+  {
+    name: "github_close_issue",
+    description: "Close a GitHub issue by number.",
+    input_schema: {
+      type: "object",
+      properties: {
+        repo: { type: "string", description: "'owner/repo'." },
+        issueNumber: { type: "number" },
+      },
+      required: ["repo", "issueNumber"],
+    },
+  },
+  {
+    name: "shopify_summary",
+    description: "E-commerce snapshot for the jewelry/Onde store: orders + revenue last 24h, low-stock variants. Use for 'מה המצב בחנות', sales questions, and briefs when Shopify is configured.",
+    input_schema: { type: "object", properties: {} },
+  },
 ];
 
 // ── Tool executor ─────────────────────────────────────────────────────────────
@@ -593,6 +633,17 @@ async function executeTool(name: string, input: Record<string, unknown>, chatId:
         out = JSON.stringify(
           await recallContext(input.query as string, (input.domain as string) ?? null), null, 2
         ); break;
+      case "github_issues":
+        out = JSON.stringify(await githubOpenIssues(input.repo as string | undefined), null, 2); break;
+      case "github_create_issue":
+        out = JSON.stringify(
+          await githubCreateIssue(input.repo as string, input.title as string, input.body as string | undefined), null, 2
+        ); break;
+      case "github_close_issue":
+        await githubCloseIssue(input.repo as string, input.issueNumber as number);
+        out = JSON.stringify({ ok: true }); break;
+      case "shopify_summary":
+        out = JSON.stringify(await shopifySummary(), null, 2); break;
       default:
         out = `Unknown tool: ${name}`;
     }
@@ -885,12 +936,21 @@ cron.schedule("30 6 * * *", async () => {
   }
 }, { timezone: "Asia/Jerusalem" });
 
-// 07:00 — morning brief (strict 12-line template)
-cron.schedule("0 7 * * *", () => {
-  sendScheduled(
-    "בריף בוקר. הרץ במקביל: get_daily_focus, מזג אוויר, יומן היום, get_tasks, מיילים. " +
-    "פלט לפי BRIEF TEMPLATE בדיוק — 12 שורות מקסימום. בלי טבלאות, בלי ---, בלי כותרות."
+// 07:00 — morning brief (strict template; deep-work streams added when configured)
+function morningBriefPrompt(): string {
+  const extras: string[] = [];
+  if (githubConfigured()) extras.push("github_issues — שורת 💻 אם יש issues פתוחים");
+  if (shopifyConfigured()) extras.push("shopify_summary — שורת 🛒 הזמנות/מלאי נמוך");
+  const extraTools = extras.length ? ` בנוסף הרץ: ${extras.join("; ")}. ` : " ";
+  const maxLines = 12 + extras.length;
+  return (
+    "בריף בוקר. הרץ במקביל: get_daily_focus, מזג אוויר, יומן היום, get_tasks, מיילים." +
+    extraTools +
+    `פלט לפי BRIEF TEMPLATE בדיוק — ${maxLines} שורות מקסימום. בלי טבלאות, בלי ---, בלי כותרות.`
   );
+}
+cron.schedule("0 7 * * *", () => {
+  sendScheduled(morningBriefPrompt());
 }, { timezone: "Asia/Jerusalem" });
 
 // 12:30 — midday check (3 lines max)
@@ -909,10 +969,15 @@ cron.schedule("0 22 * * *", () => {
   );
 }, { timezone: "Asia/Jerusalem" });
 
-// Sunday 08:00 — weekly planning (10 lines max)
+// Sunday 08:00 — weekly planning (10 lines max + deep-work streams)
 cron.schedule("0 8 * * 0", () => {
+  const extras: string[] = [];
+  if (githubConfigured()) extras.push("github_issues (שורת 💻 issues פתוחים/ישנים)");
+  if (shopifyConfigured()) extras.push("shopify_summary (שורת 🛒 מגמת מכירות)");
   sendScheduled(
-    "תכנון שבוע. הרץ get_productivity_stats + get_tasks + יומן השבוע. פלט 10 שורות מקסימום: " +
+    "תכנון שבוע. הרץ get_productivity_stats + get_tasks + יומן השבוע" +
+    (extras.length ? ` + ${extras.join(" + ")}` : "") +
+    ". פלט 10 שורות מקסימום: " +
     "📈 velocity מול שבוע שעבר (שורה) | 🎯 3 יעדים לשבוע (3 שורות, לפי backlog) | " +
     "🕐 2 time-blocks מוצעים (2 שורות) | שאלה: מה היעד הכי חשוב השבוע?"
   );
