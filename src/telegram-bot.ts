@@ -22,6 +22,7 @@ import { loadReminders, upsertReminder, deleteReminder, type Reminder } from "./
 import { loadUserFacts, upsertFact, deleteFact } from "./user-memory.js";
 import { webSearch, getWeather, getExchangeRate } from "./web-search.js";
 import { CONTEXTS, getActiveContext, setActiveContext, resolveContext } from "./context-store.js";
+import { ensureSchema, dbMode } from "./db.js";
 import { getTodayFocus, setTodayFocus, markFocusDone, formatFocus } from "./focus-store.js";
 import { logCompletion, getWeekStats } from "./stats-store.js";
 import { listRecurring, addRecurring, deleteRecurring, popDueToday, describeSchedule } from "./recurring-store.js";
@@ -1651,6 +1652,14 @@ process.once("SIGTERM", () => bot.stop());
 
 console.log("🤖 Personal Assistant Telegram bot starting...");
 loadChatId().then(async () => {
+  // Durable storage: create schema when Postgres is attached (no-op in JSON mode)
+  try {
+    await ensureSchema();
+    console.log(`[db] storage mode: ${dbMode()}`);
+  } catch (err) {
+    console.error("[db] schema init failed — continuing in degraded mode:", err);
+  }
+
   // Re-schedule persisted reminders
   const pending = await loadReminders();
   let rescheduled = 0;

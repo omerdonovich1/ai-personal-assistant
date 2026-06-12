@@ -2,6 +2,7 @@ import { readFile, writeFile } from "fs/promises";
 import { mkdirSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
+import { db, ensureSchema } from "./db.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -17,7 +18,7 @@ export interface RecurringTask {
   lastRun: string | null; // YYYY-MM-DD
 }
 
-async function load(): Promise<RecurringTask[]> {
+async function loadJson(): Promise<RecurringTask[]> {
   try {
     return JSON.parse(await readFile(FILE, "utf-8")) as RecurringTask[];
   } catch {
@@ -25,17 +26,25 @@ async function load(): Promise<RecurringTask[]> {
   }
 }
 
-async function save(all: RecurringTask[]): Promise<void> {
+async function saveJson(all: RecurringTask[]): Promise<void> {
   mkdirSync(DATA_DIR, { recursive: true });
   await writeFile(FILE, JSON.stringify(all, null, 2));
 }
 
+function rowToTask(r: { id: string; title: string; list_name: string; schedule: string; last_run: string | null }): RecurringTask {
+  return { id: r.id, title: r.title, listName: r.list_name, schedule: r.schedule, lastRun: r.last_run };
+}
+
 export async function listRecurring(): Promise<RecurringTask[]> {
-  return load();
+  if (db) {
+    await ensureSchema();
+    const r = await db.query("SELECT * FROM recurring ORDER BY id");
+    return r.rows.map(rowToTask);
+  }
+  return loadJson();
 }
 
 export async function addRecurring(title: string, listName: string, schedule: string): Promise<RecurringTask> {
-  const all = await load();
   const t: RecurringTask = {
     id: `rec_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
     title,
@@ -43,27 +52,41 @@ export async function addRecurring(title: string, listName: string, schedule: st
     schedule,
     lastRun: null,
   };
-  all.push(t);
-  await save(all);
+  if (db) {
+    await ensureSchema();
+    await db.query(
+      "INSERT INTO recurring (id, title, list_name, schedule, last_run) VALUES ($1, $2, $3, $4, $5)",
+      [t.id, t.title, t.listName, t.schedule, t.lastRun]
+    );
+  } else {
+    const all = await loadJson();
+    all.push(t);
+    await saveJson(all);
+  }
   return t;
 }
 
 export async function deleteRecurring(id: string): Promise<boolean> {
-  const all = await load();
+  if (db) {
+    await ensureSchema();
+    const r = await db.query("DELETE FROM recurring WHERE id = $1", [id]);
+    return (r.rowCount ?? 0) > 0;
+  }
+  const all = await loadJson();
   const filtered = all.filter((t) => t.id !== id);
   if (filtered.length === all.length) return false;
-  await save(filtered);
+  await saveJson(filtered);
   return true;
 }
 
 /** Returns templates due today that haven't run yet today, and marks them as run. */
 export async function popDueToday(): Promise<RecurringTask[]> {
-  const all = await load();
   const israelNow = new Date(Date.now() + 3 * 60 * 60 * 1000);
   const today = israelNow.toISOString().slice(0, 10);
   const dayOfWeek = israelNow.getUTCDay(); // 0=Sunday
   const dayOfMonth = israelNow.getUTCDate();
 
+  const all = await listRecurring();
   const due = all.filter((t) => {
     if (t.lastRun === today) return false;
     if (t.schedule === "daily") return true;
@@ -74,8 +97,20 @@ export async function popDueToday(): Promise<RecurringTask[]> {
   });
 
   if (due.length > 0) {
-    for (const t of due) t.lastRun = today;
-    await save(all);
+    if (db) {
+      for (const t of due) {
+        await db.query("UPDATE recurring SET last_run = $2 WHERE id = $1", [t.id, today]);
+        t.lastRun = today;
+      }
+    } else {
+      const json = await loadJson();
+      for (const t of due) {
+        const row = json.find((x) => x.id === t.id);
+        if (row) row.lastRun = today;
+        t.lastRun = today;
+      }
+      await saveJson(json);
+    }
   }
   return due;
 }

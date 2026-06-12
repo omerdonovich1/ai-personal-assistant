@@ -2,6 +2,7 @@ import { readFile, writeFile } from "fs/promises";
 import { mkdirSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
+import { db, ensureSchema } from "./db.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -18,7 +19,11 @@ export interface DailyFocus {
   items: FocusItem[];
 }
 
-async function load(): Promise<DailyFocus | null> {
+export function israelToday(): string {
+  return new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
+async function loadJson(): Promise<DailyFocus | null> {
   try {
     return JSON.parse(await readFile(FILE, "utf-8")) as DailyFocus;
   } catch {
@@ -26,18 +31,20 @@ async function load(): Promise<DailyFocus | null> {
   }
 }
 
-async function save(f: DailyFocus): Promise<void> {
+async function saveJson(f: DailyFocus): Promise<void> {
   mkdirSync(DATA_DIR, { recursive: true });
   await writeFile(FILE, JSON.stringify(f, null, 2));
 }
 
-export function israelToday(): string {
-  return new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString().slice(0, 10);
-}
-
 /** Returns today's focus, or null if not set yet (or stale from a previous day). */
 export async function getTodayFocus(): Promise<DailyFocus | null> {
-  const f = await load();
+  if (db) {
+    await ensureSchema();
+    const r = await db.query("SELECT date, items FROM focus WHERE date = $1", [israelToday()]);
+    if (r.rows.length === 0) return null;
+    return { date: r.rows[0].date, items: r.rows[0].items as FocusItem[] };
+  }
+  const f = await loadJson();
   if (!f || f.date !== israelToday()) return null;
   return f;
 }
@@ -47,7 +54,15 @@ export async function setTodayFocus(items: string[]): Promise<DailyFocus> {
     date: israelToday(),
     items: items.slice(0, 3).map((text) => ({ text, done: false })),
   };
-  await save(f);
+  if (db) {
+    await ensureSchema();
+    await db.query(
+      "INSERT INTO focus (date, items) VALUES ($1, $2) ON CONFLICT (date) DO UPDATE SET items = $2",
+      [f.date, JSON.stringify(f.items)]
+    );
+  } else {
+    await saveJson(f);
+  }
   return f;
 }
 
@@ -65,7 +80,11 @@ export async function markFocusDone(indexOrText: string): Promise<DailyFocus | n
     if (!item) return null;
     item.done = true;
   }
-  await save(f);
+  if (db) {
+    await db.query("UPDATE focus SET items = $2 WHERE date = $1", [f.date, JSON.stringify(f.items)]);
+  } else {
+    await saveJson(f);
+  }
   return f;
 }
 

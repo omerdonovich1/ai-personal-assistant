@@ -24,11 +24,14 @@
     "googleapis": "^171.4.0",
     "grammy": "^1.43.0",
     "groq-sdk": "^1.2.0",
-    "node-cron": "^4.2.1"
+    "node-cron": "^4.2.1",
+    "pg": "^8.21.0",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^25.9.1",
     "@types/node-cron": "^3.0.11",
+    "@types/pg": "^8.20.0",
     "ts-node": "^10.9.2",
     "typescript": "^6.0.3"
   }

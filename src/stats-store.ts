@@ -2,6 +2,7 @@ import { readFile, writeFile } from "fs/promises";
 import { mkdirSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
+import { db, ensureSchema } from "./db.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -14,7 +15,11 @@ export interface CompletionEntry {
   list: string;
 }
 
-async function load(): Promise<CompletionEntry[]> {
+function israelToday(): string {
+  return new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
+async function loadJson(): Promise<CompletionEntry[]> {
   try {
     return JSON.parse(await readFile(FILE, "utf-8")) as CompletionEntry[];
   } catch {
@@ -23,10 +28,17 @@ async function load(): Promise<CompletionEntry[]> {
 }
 
 export async function logCompletion(title: string, list: string): Promise<void> {
-  const all = await load();
-  const date = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const date = israelToday();
+  if (db) {
+    await ensureSchema();
+    await db.query("INSERT INTO completions (date, title, list) VALUES ($1, $2, $3)", [date, title, list]);
+    // prune >90 days
+    const cutoff = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    await db.query("DELETE FROM completions WHERE date < $1", [cutoff]);
+    return;
+  }
+  const all = await loadJson();
   all.push({ date, title, list });
-  // Keep last 90 days only
   const cutoff = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const trimmed = all.filter((e) => e.date >= cutoff);
   mkdirSync(DATA_DIR, { recursive: true });
@@ -41,8 +53,17 @@ export interface WeekStats {
   recentTitles: string[];
 }
 
+async function loadAll(): Promise<CompletionEntry[]> {
+  if (db) {
+    await ensureSchema();
+    const r = await db.query("SELECT date, title, list FROM completions ORDER BY id");
+    return r.rows as CompletionEntry[];
+  }
+  return loadJson();
+}
+
 export async function getWeekStats(): Promise<WeekStats> {
-  const all = await load();
+  const all = await loadAll();
   const now = Date.now() + 3 * 60 * 60 * 1000;
   const weekAgo = new Date(now - 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const twoWeeksAgo = new Date(now - 14 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
