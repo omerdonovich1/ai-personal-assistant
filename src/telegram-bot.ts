@@ -87,7 +87,8 @@ type WizardState =
   | { type: "event";    stage: "datetime"; title: string }
   | { type: "reminder"; stage: "text" }
   | { type: "reminder"; stage: "time";  text: string }
-  | { type: "newlist";  stage: "name" };
+  | { type: "newlist";  stage: "name" }
+  | { type: "focus";    stage: "items" };
 
 const wizardStates = new Map<number, WizardState>();
 
@@ -634,6 +635,7 @@ Default location: בית חרות, ישראל.${contextSection}${factsSection}
 ## DAILY FOCUS — the backbone of the day:
 - Today's focus = the 1-3 tasks that MUST happen today. Stored via set_daily_focus.
 - EVERY brief starts by calling get_daily_focus. If not set → ask: "מה 3 הדברים שחייבים לקרות היום?" then call set_daily_focus with the answer.
+- CRITICAL: when you just asked for the day's focus and the user replies with a list of things, call set_daily_focus with those exact items — nothing else. NEVER turn focus items into calendar events or tasks, and NEVER invent dates/times for them. They are a focus list, not a schedule. Reply only: "🎯 הפוקוס של היום נקבע:" + the items.
 - When user says they finished something → check if it matches a focus item → mark_focus_done + celebrate briefly: "🎯 2/3 הושלמו".
 - If user asks "מה עכשיו?" → answer with the next unfinished focus item.
 
@@ -954,8 +956,9 @@ bot.hears("🎯 פוקוס", async (ctx) => {
       { parse_mode: "Markdown", reply_markup: MAIN_KEYBOARD }
     );
   }
-  // No focus yet — start the conversation through the agent so it calls set_daily_focus
-  await ctx.reply("עוד לא הגדרת פוקוס להיום.\n\nמה 3 הדברים שחייבים לקרות היום? (כתוב אותם בהודעה אחת)");
+  // No focus yet — capture the next message DIRECTLY as focus items (deterministic, no agent).
+  wizardStates.set(ctx.chat.id, { type: "focus", stage: "items" });
+  await ctx.reply("עוד לא הגדרת פוקוס להיום.\n\nמה 3 הדברים שחייבים לקרות היום? (כתוב אותם בהודעה אחת, שורה לכל אחד)");
 });
 
 bot.hears("📈 נתונים", async (ctx) => {
@@ -1335,6 +1338,23 @@ async function handleWizard(chatId: number, text: string, state: WizardState): P
     }
   }
 
+  if (state.type === "focus") {
+    wizardStates.delete(chatId);
+    // Parse one item per line; strip leading bullets/dashes/numbers. Take up to 3.
+    const items = text
+      .split("\n")
+      .map((l) => l.replace(/^\s*[-•*\d.)]+\s*/, "").trim())
+      .filter(Boolean)
+      .slice(0, 3);
+    if (items.length === 0) {
+      await bot.api.sendMessage(chatId, "לא זיהיתי משימות — נסה שוב עם 🎯 פוקוס.");
+      return;
+    }
+    const f = await setTodayFocus(items);
+    await bot.api.sendMessage(chatId, `🎯 הפוקוס של היום נקבע:\n\n${formatFocus(f)}\n\n_סיימת אחת? כתוב "סיימתי 1"._`, { parse_mode: "Markdown", reply_markup: MAIN_KEYBOARD });
+    return;
+  }
+
   if (state.type === "newlist") {
     wizardStates.delete(chatId);
     const name = text.trim();
@@ -1442,7 +1462,8 @@ bot.command("focus", async (ctx) => {
       { parse_mode: "Markdown", reply_markup: MAIN_KEYBOARD }
     );
   }
-  return ctx.reply("עוד לא הגדרת פוקוס להיום.\n\nמה 3 הדברים שחייבים לקרות היום?");
+  wizardStates.set(ctx.chat.id, { type: "focus", stage: "items" });
+  return ctx.reply("עוד לא הגדרת פוקוס להיום.\n\nמה 3 הדברים שחייבים לקרות היום? (שורה לכל אחד)");
 });
 
 bot.command("review", async (ctx) => {
