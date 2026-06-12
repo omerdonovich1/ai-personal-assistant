@@ -26,6 +26,7 @@ import { ensureSchema, dbMode } from "./db.js";
 import { modelFor, type ModelTier } from "./llm.js";
 import { routeMessage } from "./router.js";
 import { initMcp, getMcpTools, isMcpTool, executeMcpTool } from "./mcp-client.js";
+import { rememberContext, recallContext, seedFromFacts } from "./vector-memory.js";
 import { getTodayFocus, setTodayFocus, markFocusDone, formatFocus } from "./focus-store.js";
 import { logCompletion, getWeekStats } from "./stats-store.js";
 import { listRecurring, addRecurring, deleteRecurring, popDueToday, describeSchedule } from "./recurring-store.js";
@@ -447,6 +448,31 @@ const TOOLS: Anthropic.Tool[] = [
     description: "Get task-completion statistics: this week vs last week, breakdown by domain and by day. Use for weekly reviews and when the user asks about progress/velocity.",
     input_schema: { type: "object", properties: {} },
   },
+  {
+    name: "remember_context",
+    description: "Store long-term context in vector memory: decisions, technical specs, business details, preferences. Call AUTONOMOUSLY whenever the user states a decision ('החלטתי', 'נסגר על'), a spec (hardware, configs, architecture choices), or domain knowledge worth keeping.",
+    input_schema: {
+      type: "object",
+      properties: {
+        content: { type: "string", description: "The context to remember, self-contained and specific." },
+        domain: { type: "string", description: "Domain key: 'spinz', 'jewelry', 'dynamika', 'home', 'sunshine'. Omit for global." },
+        type: { type: "string", description: "'decision' | 'spec' | 'preference' | 'note'. Default 'note'." },
+      },
+      required: ["content"],
+    },
+  },
+  {
+    name: "recall_context",
+    description: "Search long-term vector memory for relevant historical context, past decisions, and specs. Use when the user references past work or when deeper background would improve the answer.",
+    input_schema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "What to search for." },
+        domain: { type: "string", description: "Optional domain filter." },
+      },
+      required: ["query"],
+    },
+  },
 ];
 
 // ── Tool executor ─────────────────────────────────────────────────────────────
@@ -559,6 +585,14 @@ async function executeTool(name: string, input: Record<string, unknown>, chatId:
         out = JSON.stringify({ ok: await deleteRecurring(input.id as string) }); break;
       case "get_productivity_stats":
         out = JSON.stringify(await getWeekStats(), null, 2); break;
+      case "remember_context":
+        out = JSON.stringify(
+          await rememberContext(input.content as string, (input.domain as string) ?? null, (input.type as string) ?? "note")
+        ); break;
+      case "recall_context":
+        out = JSON.stringify(
+          await recallContext(input.query as string, (input.domain as string) ?? null), null, 2
+        ); break;
       default:
         out = `Unknown tool: ${name}`;
     }
@@ -602,6 +636,22 @@ async function runAgent(
   // Load active context
   const activeCtx = await getActiveContext();
 
+  // Autonomous context injection: recall relevant long-term memories for this
+  // message + active domain, so the user never repeats established context.
+  let memorySection = "";
+  if (userText.length > 12) {
+    try {
+      const memories = await recallContext(userText, activeCtx?.key ?? null, 5);
+      if (memories.length > 0) {
+        memorySection =
+          `\n\n## הקשר רלוונטי מהזיכרון (השתמש בו טבעית, אל תצטט אותו):\n` +
+          memories.map((m) => `- [${m.domain ?? "כללי"}/${m.type}] ${m.content}`).join("\n");
+      }
+    } catch (err) {
+      console.error("[memory] recall failed:", err instanceof Error ? err.message : err);
+    }
+  }
+
   // Load user memory facts (global + context-specific)
   const facts = await loadUserFacts(activeCtx?.key ?? null);
   const factsSection = facts.length > 0
@@ -618,7 +668,7 @@ async function runAgent(
 
   const SYSTEM = `You are an elite Executive AI Assistant and thinking partner. Reply ONLY in Hebrew. Sharp, direct, zero fluff.
 Now: ${israelTimeStr} (UTC+3). All ISO datetimes MUST use +03:00. Today: ${israelDateStr}.
-Default location: בית חרות, ישראל.${contextSection}${factsSection}
+Default location: בית חרות, ישראל.${contextSection}${factsSection}${memorySection}
 
 ## CORE PHILOSOPHY — you are NOT a data collector. You are a thinking partner.
 - Never just list data. Always: analyze → prioritize → surface insights → ask ONE focused question.
@@ -1677,6 +1727,15 @@ loadChatId().then(async () => {
 
   // MCP: connect configured external tool servers (no-op when MCP_SERVERS unset)
   await initMcp().catch((err) => console.error("[mcp] init failed:", err));
+
+  // Vector memory: one-time seed from legacy user-memory facts
+  try {
+    const facts = await loadUserFacts(undefined);
+    const seeded = await seedFromFacts(facts);
+    if (seeded > 0) console.log(`[memory] seeded ${seeded} legacy facts into vector memory`);
+  } catch (err) {
+    console.error("[memory] seed failed:", err);
+  }
 
   // Re-schedule persisted reminders
   const pending = await loadReminders();
