@@ -12,11 +12,40 @@ export interface CalendarEvent {
 }
 
 // Accepts any reasonable date string and returns a full ISO 8601 with time.
-// Handles "2026-05-25" (date-only) → "2026-05-25T00:00:00.000Z"
-function toISO(input: string): string {
+// Throws a clear error on unparseable input instead of silently using "now"
+// (a silent fallback created wrong events and hid bugs).
+function toISO(input: string, label = "תאריך"): string {
   const d = new Date(input);
   if (!isNaN(d.getTime())) return d.toISOString();
-  return new Date().toISOString(); // fallback to now
+  throw new Error(`${label} לא תקין: "${input}"`);
+}
+
+// Day-name → RFC5545 two-letter code, so Hebrew/English names from the model
+// don't blow up events.insert with "Invalid recurrence rule".
+const DAY_CODES: Record<string, string> = {
+  sunday: "SU", monday: "MO", tuesday: "TU", wednesday: "WE", thursday: "TH", friday: "FR", saturday: "SA",
+  sun: "SU", mon: "MO", tue: "TU", wed: "WE", thu: "TH", fri: "FR", sat: "SA",
+  ראשון: "SU", שני: "MO", שלישי: "TU", רביעי: "WE", חמישי: "TH", שישי: "FR", שבת: "SA",
+};
+
+function sanitizeRecurrence(rules?: string[]): string[] | undefined {
+  if (!rules || rules.length === 0) return undefined;
+  const cleaned = rules
+    .map((raw) => {
+      let r = raw.trim();
+      if (!/^RRULE:/i.test(r)) r = `RRULE:${r}`;            // ensure prefix
+      // Normalize BYDAY day names → two-letter codes
+      r = r.replace(/BYDAY=([^;]+)/i, (_m, days: string) => {
+        const codes = days.split(",").map((d) => {
+          const key = d.trim().toLowerCase();
+          return DAY_CODES[key] ?? d.trim().toUpperCase().slice(0, 2);
+        });
+        return `BYDAY=${codes.join(",")}`;
+      });
+      return r;
+    })
+    .filter((r) => /FREQ=(DAILY|WEEKLY|MONTHLY|YEARLY)/i.test(r)); // drop junk
+  return cleaned.length > 0 ? cleaned : undefined;
 }
 
 export async function getCalendarEvents(
@@ -80,15 +109,23 @@ export async function addCalendarEvent(
   const auth = await getAuthClient();
   const calendar = google.calendar({ version: "v3", auth });
 
+  const startISO = toISO(startDateTime, "שעת התחלה");
+  let endISO = toISO(endDateTime, "שעת סיום");
+  // Guard: end must be after start — default to +1h when the model gets it wrong.
+  if (new Date(endISO).getTime() <= new Date(startISO).getTime()) {
+    endISO = new Date(new Date(startISO).getTime() + 60 * 60 * 1000).toISOString();
+  }
+  const rules = sanitizeRecurrence(recurrence);
+
   const response = await calendar.events.insert({
     calendarId: "primary",
     requestBody: {
       summary,
       description,
       location,
-      start: { dateTime: toISO(startDateTime), timeZone: "Asia/Jerusalem" },
-      end: { dateTime: toISO(endDateTime), timeZone: "Asia/Jerusalem" },
-      ...(recurrence && recurrence.length > 0 ? { recurrence } : {}),
+      start: { dateTime: startISO, timeZone: "Asia/Jerusalem" },
+      end: { dateTime: endISO, timeZone: "Asia/Jerusalem" },
+      ...(rules ? { recurrence: rules } : {}),
     },
   });
 

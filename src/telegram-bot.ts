@@ -1061,7 +1061,7 @@ bot.callbackQuery(/^tdone:(\d+)$/, async (ctx) => {
     cached[idx] = { ...task, id: "", title: "" };
     await rerenderAfterRemoval(ctx, chatId, listId, `✅ הושלם: ${task.title}`);
   } catch (err) {
-    await ctx.editMessageText(`❌ שגיאה: ${err instanceof Error ? err.message : String(err)}`);
+    await ctx.editMessageText(`❌ שגיאה בהשלמת משימה: ${err instanceof Error ? err.message : String(err)}`);
   }
 });
 
@@ -1092,7 +1092,7 @@ bot.callbackQuery(/^tdelyes:(\d+)$/, async (ctx) => {
     cached[idx] = { ...task, id: "", title: "" };
     await rerenderAfterRemoval(ctx, chatId, listId, `🗑 נמחק: ${task.title}`);
   } catch (err) {
-    await ctx.editMessageText(`❌ שגיאה: ${err instanceof Error ? err.message : String(err)}`);
+    await ctx.editMessageText(`❌ שגיאה במחיקת משימה: ${err instanceof Error ? err.message : String(err)}`);
   }
 });
 
@@ -1132,7 +1132,7 @@ bot.callbackQuery(/^tmoveto:(\d+):(\d+)$/, async (ctx) => {
     cached.push({ id: moved.id, listId: target.id, title: moved.title, listTitle: target.title, due: moved.due });
     await rerenderAfterRemoval(ctx, chatId, sourceId, `📂 "${task.title}" → ${target.title}`);
   } catch (err) {
-    await ctx.editMessageText(`❌ שגיאה: ${err instanceof Error ? err.message : String(err)}`);
+    await ctx.editMessageText(`❌ שגיאה בהעברת משימה: ${err instanceof Error ? err.message : String(err)}`);
   }
 });
 
@@ -1190,7 +1190,7 @@ bot.callbackQuery(/^ldelyes:(\d+)$/, async (ctx) => {
       reply_markup: new InlineKeyboard().text("🔙 לרשימות", "tlists"),
     });
   } catch (err) {
-    await ctx.editMessageText(`❌ שגיאה: ${err instanceof Error ? err.message : String(err)}`);
+    await ctx.editMessageText(`❌ שגיאה במחיקת רשימה: ${err instanceof Error ? err.message : String(err)}`);
   }
 });
 
@@ -1277,7 +1277,7 @@ async function doAddTask(chatId: number, name: string, listName: string, dueText
       { parse_mode: "Markdown", reply_markup: MAIN_KEYBOARD }
     );
   } catch (err) {
-    await bot.api.sendMessage(chatId, `❌ שגיאה: ${err instanceof Error ? err.message : String(err)}`);
+    await bot.api.sendMessage(chatId, `❌ שגיאה בהוספת משימה: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -1311,7 +1311,7 @@ async function handleWizard(chatId: number, text: string, state: WizardState): P
         const reply = await runAgent(chatId, `הוסף אירוע ביומן: "${state.title}" — ${text}. השתמש ב-add_calendar_event.`);
         await safeSend(chatId, reply);
       } catch (err) {
-        await bot.api.sendMessage(chatId, `❌ שגיאה: ${err instanceof Error ? err.message : String(err)}`);
+        await bot.api.sendMessage(chatId, `❌ שגיאה ביצירת אירוע: ${err instanceof Error ? err.message : String(err)}`);
       }
       return;
     }
@@ -1329,7 +1329,7 @@ async function handleWizard(chatId: number, text: string, state: WizardState): P
         const reply = await runAgent(chatId, `קבע תזכורת: "${state.text}" — ${text}. השתמש ב-set_reminder.`);
         await safeSend(chatId, reply);
       } catch (err) {
-        await bot.api.sendMessage(chatId, `❌ שגיאה: ${err instanceof Error ? err.message : String(err)}`);
+        await bot.api.sendMessage(chatId, `❌ שגיאה בתזכורת: ${err instanceof Error ? err.message : String(err)}`);
       }
       return;
     }
