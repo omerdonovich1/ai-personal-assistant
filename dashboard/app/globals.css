@@ -1,0 +1,16 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  background: #0a0a0a;
+  color: #e5e5e5;
+}
+
+* {
+  transition: background-color 150ms ease, border-color 150ms ease, opacity 150ms ease;
+}

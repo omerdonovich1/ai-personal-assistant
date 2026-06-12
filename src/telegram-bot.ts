@@ -128,6 +128,23 @@ async function refreshTaskCache(chatId: number): Promise<void> {
       .filter((t) => t.status === "needsAction")
       .map((t) => ({ id: t.id, listId: t.listId, title: t.title, listTitle: t.listTitle, due: t.due }))
   );
+  void snapshotTasks(tasks).catch(() => {});
+}
+
+/** Mirror open Google Tasks into Postgres so the dashboard can read them without Google OAuth. */
+async function snapshotTasks(tasks: Awaited<ReturnType<typeof getTasks>>): Promise<void> {
+  const { db } = await import("./db.js");
+  if (!db) return;
+  await ensureSchema();
+  const open = tasks.filter((t) => t.status === "needsAction");
+  await db.query("DELETE FROM tasks_snapshot");
+  for (const t of open) {
+    await db.query(
+      `INSERT INTO tasks_snapshot (task_id, title, list_title, due, updated) VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (task_id) DO UPDATE SET title = $2, list_title = $3, due = $4, updated = $5, snapped_at = now()`,
+      [t.id, t.title, t.listTitle, t.due, t.updated]
+    );
+  }
 }
 
 function buildListsKeyboard(chatId: number): InlineKeyboard {
@@ -951,6 +968,15 @@ function morningBriefPrompt(): string {
 }
 cron.schedule("0 7 * * *", () => {
   sendScheduled(morningBriefPrompt());
+}, { timezone: "Asia/Jerusalem" });
+
+// Every 30 min — refresh tasks snapshot for the dashboard (Postgres only)
+cron.schedule("*/30 * * * *", async () => {
+  try {
+    await snapshotTasks(await getTasks());
+  } catch (err) {
+    console.error("[snapshot] failed:", err instanceof Error ? err.message : err);
+  }
 }, { timezone: "Asia/Jerusalem" });
 
 // 12:30 — midday check (3 lines max)
