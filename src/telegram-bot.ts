@@ -23,6 +23,9 @@ import { loadUserFacts, upsertFact, deleteFact } from "./user-memory.js";
 import { webSearch, getWeather, getExchangeRate } from "./web-search.js";
 import { CONTEXTS, getActiveContext, setActiveContext, resolveContext } from "./context-store.js";
 import { ensureSchema, dbMode } from "./db.js";
+import { modelFor, type ModelTier } from "./llm.js";
+import { routeMessage } from "./router.js";
+import { initMcp, getMcpTools, isMcpTool, executeMcpTool } from "./mcp-client.js";
 import { getTodayFocus, setTodayFocus, markFocusDone, formatFocus } from "./focus-store.js";
 import { logCompletion, getWeekStats } from "./stats-store.js";
 import { listRecurring, addRecurring, deleteRecurring, popDueToday, describeSchedule } from "./recurring-store.js";
@@ -577,8 +580,18 @@ function keepTyping(ctx: { replyWithChatAction: (a: "typing") => Promise<unknown
 
 // ── Agentic loop ──────────────────────────────────────────────────────────────
 
-async function runAgent(chatId: number, userText: string, extraContent?: Anthropic.ContentBlockParam[]): Promise<string> {
+async function runAgent(
+  chatId: number,
+  userText: string,
+  extraContent?: Anthropic.ContentBlockParam[],
+  forceTier?: ModelTier
+): Promise<string> {
   const history = histories.get(chatId) ?? [];
+
+  // Dynamic model routing: Haiku for I/O, Sonnet for analysis, Opus for code
+  const tier = forceTier ?? routeMessage(userText);
+  const { model, maxTokens } = modelFor(tier);
+  if (tier !== "fast") console.log(`[router] tier=${tier} model=${model}`);
 
   const now = new Date();
   const israelOffset = 3 * 60 * 60 * 1000;
@@ -713,10 +726,10 @@ Extract ALL entities → run tools in parallel → single synthesized response.
 
   while (true) {
     const response = await anthropic.messages.create({
-      model: "claude-haiku-4-5",
-      max_tokens: 2048,
+      model,
+      max_tokens: maxTokens,
       system: SYSTEM,
-      tools: TOOLS,
+      tools: [...TOOLS, ...getMcpTools()],
       messages,
     });
 
@@ -730,7 +743,9 @@ Extract ALL entities → run tools in parallel → single synthesized response.
         toolBlocks.map(async (block) => ({
           type: "tool_result" as const,
           tool_use_id: block.id,
-          content: await executeTool(block.name, block.input as Record<string, unknown>, chatId),
+          content: isMcpTool(block.name)
+            ? await executeMcpTool(block.name, block.input as Record<string, unknown>).catch((e) => `Error: ${e.message}`)
+            : await executeTool(block.name, block.input as Record<string, unknown>, chatId),
         }))
       );
       messages.push({ role: "user", content: toolResults });
@@ -794,7 +809,7 @@ async function safeSend(chatId: number, text: string): Promise<void> {
 async function sendScheduled(prompt: string): Promise<void> {
   if (!registeredChatId) return;
   try {
-    const reply = await runAgent(registeredChatId, prompt);
+    const reply = await runAgent(registeredChatId, prompt, undefined, "fast");
     await safeSend(registeredChatId, reply);
   } catch (err) {
     console.error("Scheduled message error:", err);
@@ -1659,6 +1674,9 @@ loadChatId().then(async () => {
   } catch (err) {
     console.error("[db] schema init failed — continuing in degraded mode:", err);
   }
+
+  // MCP: connect configured external tool servers (no-op when MCP_SERVERS unset)
+  await initMcp().catch((err) => console.error("[mcp] init failed:", err));
 
   // Re-schedule persisted reminders
   const pending = await loadReminders();
