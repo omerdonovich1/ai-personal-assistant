@@ -27,6 +27,7 @@ import { modelFor, type ModelTier } from "./llm.js";
 import { routeMessage } from "./router.js";
 import { initMcp, getMcpTools, isMcpTool, executeMcpTool } from "./mcp-client.js";
 import { rememberContext, recallContext, seedFromFacts } from "./vector-memory.js";
+import { israelNowISO, israelDateStr as israelDate, israelOffsetStr, toIsraelISO, dateReference } from "./time.js";
 import { githubConfigured, githubOpenIssues, githubCreateIssue, githubCloseIssue } from "./services/github.js";
 import { shopifyConfigured, shopifySummary } from "./services/shopify.js";
 import { getTodayFocus, setTodayFocus, markFocusDone, formatFocus } from "./focus-store.js";
@@ -114,8 +115,7 @@ const taskCache = new Map<number, CachedTask[]>();
 
 function isOverdue(due: string | null): boolean {
   if (!due) return false;
-  const today = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString().slice(0, 10);
-  return due.slice(0, 10) < today;
+  return due.slice(0, 10) < israelDate();
 }
 
 /** Refresh both caches from Google. */
@@ -247,10 +247,8 @@ async function findFreeSlots(
 }
 
 function toIsrael(d: Date): string {
-  // Convert a UTC Date to an ISO string with +03:00 offset
-  const israelOffset = 3 * 60 * 60 * 1000;
-  const local = new Date(d.getTime() + israelOffset);
-  return local.toISOString().replace("Z", "+03:00");
+  // DST-aware Israel ISO string (delegates to the shared time helper)
+  return toIsraelISO(d);
 }
 
 // ── Tool definitions ──────────────────────────────────────────────────────────
@@ -696,10 +694,10 @@ async function runAgent(
   if (tier !== "fast") console.log(`[router] tier=${tier} model=${model}`);
 
   const now = new Date();
-  const israelOffset = 3 * 60 * 60 * 1000;
-  const israelNow = new Date(now.getTime() + israelOffset);
-  const israelTimeStr = israelNow.toISOString().replace("Z", "+03:00");
-  const israelDateStr = israelTimeStr.slice(0, 10);
+  const israelTimeStr = israelNowISO(now);
+  const israelDateStr = israelDate(now);
+  const offsetStr = israelOffsetStr(now);
+  const dateRef = dateReference(now);
 
   // Load active context
   const activeCtx = await getActiveContext();
@@ -735,8 +733,21 @@ async function runAgent(
     : "";
 
   const SYSTEM = `You are an elite Executive AI Assistant and thinking partner. Reply ONLY in Hebrew. Sharp, direct, zero fluff.
-Now: ${israelTimeStr} (UTC+3). All ISO datetimes MUST use +03:00. Today: ${israelDateStr}.
-Default location: בית חרות, ישראל.${contextSection}${factsSection}${memorySection}
+Now: ${israelTimeStr}. Default location: בית חרות, ישראל.${contextSection}${factsSection}${memorySection}
+
+## DATE REFERENCE — לוח התאריכים (קריטי, ציית בדיוק):
+${dateRef}
+חוקי תאריך/שעה — אל תסטה:
+- אסור לחשב תאריכים בעצמך. כל תאריך חייב להילקח מהטבלה למעלה בלבד.
+- כל מחרוזת ISO חייבת להסתיים ב-"${offsetStr}" (לא תמיד +03:00 — השתמש במה שכתוב כאן).
+- "מחר"/"מחרתיים"/יום בשבוע → קח את ה-YYYY-MM-DD המדויק מהטבלה.
+- שעות: בבוקר=08:00 | בצהריים=12:00 | אחה"צ=15:00 | בערב=18:00 | בלילה=21:00 | ללא שעה→09:00.
+- אם המשתמש נתן שעה מפורשת — השתמש בה כפי שהיא, אל תשנה.
+
+## דיוק ואמינות (קריטי):
+- כתוב עברית תקנית בלבד. אסור להמציא מילים, שמות, או עובדות.
+- אם אינך בטוח בפרט — שאל, אל תמציא.
+- אל תאשר פעולה שלא בוצעה בפועל דרך כלי.
 
 ## CORE PHILOSOPHY — you are NOT a data collector. You are a thinking partner.
 - Never just list data. Always: analyze → prioritize → surface insights → ask ONE focused question.
@@ -811,12 +822,13 @@ Default location: בית חרות, ישראל.${contextSection}${factsSection}${
 Rules: each line stands alone. No explanations. If a section is empty — skip the line entirely. Task names truncated, not full sentences.
 
 ## REMINDERS — CALL set_reminder IMMEDIATELY:
-- בעוד שעה=now+1h | בשעה X=today X | מחר X=tomorrow X
+- fireAt תמיד מהטבלה: "מחר 9" → התאריך של מחר + T09:00:00${offsetStr}. "בעוד שעה" → שעה נוכחית +1.
 - Reply: ✅ תזכורת: "<text>" ב-<time>
 
 ## CALENDAR:
 - add_calendar_event (Hebrew) / quick_add (English only)
-- כל שבוע → RRULE:FREQ=WEEKLY;BYDAY=XX | No end→+1h
+- startDateTime/endDateTime — תאריך מהטבלה + שעה, סיומת ${offsetStr}. No end→+1h.
+- כל שבוע → RRULE:FREQ=WEEKLY;BYDAY=XX (XX=SU/MO/TU/WE/TH/FR/SA)
 - After adding: ✅ ביומן: "<title>" — check for conflicts with existing events.
 
 ## EMAIL:
@@ -846,6 +858,9 @@ Extract ALL entities → run tools in parallel → single synthesized response.
     const response = await anthropic.messages.create({
       model,
       max_tokens: maxTokens,
+      // Low temperature: deterministic categorization and exact dates, far less
+      // hallucination / invented Hebrew. Analysis tier gets a little room.
+      temperature: tier === "fast" ? 0 : 0.3,
       system: SYSTEM,
       tools: [...TOOLS, ...getMcpTools()],
       messages,
@@ -1425,7 +1440,10 @@ async function doAddTask(chatId: number, name: string, listName: string, dueText
   try {
     let dueIso: string | undefined;
     if (dueText) {
-      const result = await runAgent(chatId, `המר את התאריך "${dueText}" ל-ISO 8601 עם +03:00. החזר רק את המחרוזת, ללא הסברים.`);
+      const result = await runAgent(
+        chatId,
+        `המר את "${dueText}" למחרוזת ISO 8601 לפי לוח התאריכים. אל תקרא לאף כלי. החזר אך ורק את המחרוזת (לדוגמה 2026-06-21T09:00:00+03:00), ללא טקסט נוסף.`
+      );
       const match = result.match(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}/);
       dueIso = match ? match[0] : undefined;
     }
