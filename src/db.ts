@@ -6,12 +6,19 @@ import pg from "pg";
 
 const { Pool } = pg;
 
+// SSL only for the PUBLIC proxy host (rlwy.net / proxy). The private network
+// host (postgres.railway.internal) speaks plaintext — forcing SSL there fails.
+function sslFor(url: string): { rejectUnauthorized: boolean } | undefined {
+  if (url.includes(".railway.internal")) return undefined;
+  if (/rlwy\.net|proxy|amazonaws|render|supabase|neon/.test(url)) return { rejectUnauthorized: false };
+  return undefined;
+}
+
 export const db: pg.Pool | null = process.env.DATABASE_URL
   ? new Pool({
       connectionString: process.env.DATABASE_URL,
       max: 5,
-      // Railway PG requires SSL from outside the private network; relax verification.
-      ssl: process.env.DATABASE_URL.includes("railway") ? { rejectUnauthorized: false } : undefined,
+      ssl: sslFor(process.env.DATABASE_URL),
     })
   : null;
 
