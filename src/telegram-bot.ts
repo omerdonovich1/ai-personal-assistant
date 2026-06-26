@@ -30,7 +30,6 @@ import { rememberContext, recallContext, seedFromFacts } from "./vector-memory.j
 import { israelNowISO, israelDateStr as israelDate, israelOffsetStr, toIsraelISO, dateReference } from "./time.js";
 import { githubConfigured, githubOpenIssues, githubCreateIssue, githubCloseIssue } from "./services/github.js";
 import { shopifyConfigured, shopifySummary } from "./services/shopify.js";
-import { getTodayFocus, setTodayFocus, markFocusDone, formatFocus } from "./focus-store.js";
 import { logCompletion, getWeekStats } from "./stats-store.js";
 import { listRecurring, addRecurring, deleteRecurring, popDueToday, describeSchedule } from "./recurring-store.js";
 
@@ -56,17 +55,18 @@ const scheduledTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
 
 const MAIN_KEYBOARD = new Keyboard()
   .text("➕ משימה").text("📋 משימות").text("📅 אירוע").row()
-  .text("⏰ תזכורת").text("🎯 פוקוס").text("📊 בריף").row()
-  .text("✅ סקירה").text("📧 מיילים").text("📈 נתונים")
+  .text("⏰ תזכורת").text("📊 בריף").text("✅ סקירה").row()
+  .text("📧 מיילים").text("📈 נתונים")
   .resized()
   .persistent();
 
 const DOMAIN_OPTIONS = [
-  { label: "🚴 SPINZ",     list: "Spinz" },
-  { label: "💍 תכשיטים",   list: "תכשיטים" },
-  { label: "💼 דינמיקה",   list: "דינמיקה" },
-  { label: "🏡 בית",       list: "חיי בית" },
-  { label: "🏠 סולשיין",   list: "סולשיין" },
+  { label: "🚴 SPINZ",        list: "Spinz" },
+  { label: "💍 תכשיטים",      list: "תכשיטים" },
+  { label: "💼 דינמיקה",      list: "דינמיקה" },
+  { label: "🚗 רכב דינמיקה",  list: "רכב דינמיקה" },
+  { label: "🏡 בית",          list: "חיי בית" },
+  { label: "🏠 סולשיין",      list: "סולשיין" },
 ];
 
 function domainKeyboard(): InlineKeyboard {
@@ -95,8 +95,7 @@ type WizardState =
   | { type: "event";    stage: "datetime"; title: string }
   | { type: "reminder"; stage: "text" }
   | { type: "reminder"; stage: "time";  text: string }
-  | { type: "newlist";  stage: "name" }
-  | { type: "focus";    stage: "items" };
+  | { type: "newlist";  stage: "name" };
 
 const wizardStates = new Map<number, WizardState>();
 
@@ -411,33 +410,6 @@ const TOOLS: Anthropic.Tool[] = [
     },
   },
   {
-    name: "set_daily_focus",
-    description: "Set today's 1-3 focus tasks (the things that MUST happen today). Call when the user states their top priorities for the day.",
-    input_schema: {
-      type: "object",
-      properties: {
-        items: { type: "array", items: { type: "string" }, description: "1-3 focus task descriptions." },
-      },
-      required: ["items"],
-    },
-  },
-  {
-    name: "get_daily_focus",
-    description: "Get today's focus tasks and their done/pending status. Call in every brief and whenever the user asks what to work on.",
-    input_schema: { type: "object", properties: {} },
-  },
-  {
-    name: "mark_focus_done",
-    description: "Mark a daily-focus item as completed, by its number (1-3) or by text match. Call when the user says they finished a focus task.",
-    input_schema: {
-      type: "object",
-      properties: {
-        indexOrText: { type: "string", description: "1-based index ('1','2','3') or part of the item text." },
-      },
-      required: ["indexOrText"],
-    },
-  },
-  {
     name: "add_recurring_task",
     description: "Create a recurring task template that auto-adds a Google Task on schedule. Use for 'כל יום/כל שבוע/כל חודש' task requests.",
     input_schema: {
@@ -618,16 +590,6 @@ async function executeTool(name: string, input: Record<string, unknown>, chatId:
         out = JSON.stringify(
           await findFreeSlots(input.date as string, input.durationMinutes as number), null, 2
         ); break;
-      case "set_daily_focus":
-        out = JSON.stringify(await setTodayFocus(input.items as string[]), null, 2); break;
-      case "get_daily_focus": {
-        const focus = await getTodayFocus();
-        out = focus ? JSON.stringify(focus, null, 2) : JSON.stringify({ set: false, message: "No focus set for today yet" }); break;
-      }
-      case "mark_focus_done": {
-        const updated = await markFocusDone(input.indexOrText as string);
-        out = updated ? JSON.stringify(updated, null, 2) : JSON.stringify({ ok: false, message: "Focus item not found or no focus set today" }); break;
-      }
       case "add_recurring_task":
         out = JSON.stringify(
           await addRecurring(input.title as string, (input.listName as string) ?? "חיי בית", input.schedule as string), null, 2
@@ -770,17 +732,11 @@ ${dateRef}
 - 🚴 SPINZ: אופניים, שלדה, single-speed, ספקי סין/Guangzhou → list "Spinz"
 - 💍 תכשיטים/Onde: Shopify, jewelry, dropshipping, e-commerce → list "תכשיטים"
 - 💼 דינמיקה/Tech: software, Carman S, Next.js, TypeScript, MCP, QC, fleet mgmt → list "דינמיקה"
+- 🚗 רכב דינמיקה: רכבי החברה, טסט/רישוי/ביטוח רכב, מוסך, פסקלים, מלגזות → list "רכב דינמיקה"
 - 🏡 חיי בית: Jack Russell, Kia Picanto, Ninja Grill, cooking, fitness, personal → list "חיי בית"
 - 🏠 סולשיין: עומר/וירין/Sunshine → list "סולשיין"
 - No keyword → infer the best-fit domain from meaning; truly unclear → "${activeCtx?.taskList ?? "חיי בית"}"
-- ONLY these 5 lists exist. NEVER pass any other listName — auto-creating lists is disabled.
-
-## DAILY FOCUS — the backbone of the day:
-- Today's focus = the 1-3 tasks that MUST happen today. Stored via set_daily_focus.
-- EVERY brief starts by calling get_daily_focus. If not set → ask: "מה 3 הדברים שחייבים לקרות היום?" then call set_daily_focus with the answer.
-- CRITICAL: when you just asked for the day's focus and the user replies with a list of things, call set_daily_focus with those exact items — nothing else. NEVER turn focus items into calendar events or tasks, and NEVER invent dates/times for them. They are a focus list, not a schedule. Reply only: "🎯 הפוקוס של היום נקבע:" + the items.
-- When user says they finished something → check if it matches a focus item → mark_focus_done + celebrate briefly: "🎯 2/3 הושלמו".
-- If user asks "מה עכשיו?" → answer with the next unfinished focus item.
+- ONLY these 6 lists exist. NEVER pass any other listName — auto-creating lists is disabled.
 
 ## TASKS — ENGAGE, don't just log:
 - Call add_task IMMEDIATELY (no prior confirmation).
@@ -805,21 +761,22 @@ ${dateRef}
 - No lunch window 12:00-14:00 → "⚠️ אין חלון לארוחת צהריים"
 - Meeting after 20:00 → flag it.
 
-## BRIEF TEMPLATE — copy this EXACT structure, 12 lines max, nothing more:
+## MORNING BRIEF — full task dump grouped by domain, then context:
+מבנה (ללא טבלאות, ללא ---):
 ☀️ <temp>° <desc one word>
-🎯 <focus status: "2/3" or "לא הוגדר">
 
-⚡ היום:
-1. 🔴 <task — max 6 words> — <reason, max 5 words>
-2. 🟡 <task> — <reason>
-3. 🟠 <task> — <reason>
+📋 כל המשימות הפתוחות (לפי תחום, ממוין 🔴 קודם):
+💼 דינמיקה (N): <task> · <task>
+🚗 רכב דינמיקה (N): <task>
+🚴 SPINZ (N): <task> · <task>
+💍 תכשיטים (N): ...
+🏡 בית (N): ...
+(דלג על תחום ריק)
 
-⚠️ <single most important alert: overdue count / calendar conflict / urgent email>
-🕐 <free window> → <suggested task>
+⚠️ <התרעה אחת חשובה: כמה באיחור / קונפליקט ביומן / מייל דחוף>
+🕐 <חלון פנוי> → <משימה מוצעת>
 
-<ONE closing question, one line>
-
-Rules: each line stands alone. No explanations. If a section is empty — skip the line entirely. Task names truncated, not full sentences.
+חוקים: כל משימה בשורה אחת, מקוצרת. תחום ריק — דלג. בלי שאלת סיום.
 
 ## REMINDERS — CALL set_reminder IMMEDIATELY:
 - fireAt תמיד מהטבלה: "מחר 9" → התאריך של מחר + T09:00:00${offsetStr}. "בעוד שעה" → שעה נוכחית +1.
@@ -968,17 +925,16 @@ cron.schedule("30 6 * * *", async () => {
   }
 }, { timezone: "Asia/Jerusalem" });
 
-// 07:00 — morning brief (strict template; deep-work streams added when configured)
+// 07:00 — morning brief: full task dump across all domains + context
 function morningBriefPrompt(): string {
   const extras: string[] = [];
   if (githubConfigured()) extras.push("github_issues — שורת 💻 אם יש issues פתוחים");
   if (shopifyConfigured()) extras.push("shopify_summary — שורת 🛒 הזמנות/מלאי נמוך");
-  const extraTools = extras.length ? ` בנוסף הרץ: ${extras.join("; ")}. ` : " ";
-  const maxLines = 12 + extras.length;
+  const extraTools = extras.length ? ` בנוסף הרץ: ${extras.join("; ")}.` : "";
   return (
-    "בריף בוקר. הרץ במקביל: get_daily_focus, מזג אוויר, יומן היום, get_tasks, מיילים." +
+    "בריף בוקר. הרץ במקביל: get_tasks (כל הרשימות), מזג אוויר, יומן היום, מיילים." +
     extraTools +
-    `פלט לפי BRIEF TEMPLATE בדיוק — ${maxLines} שורות מקסימום. בלי טבלאות, בלי ---, בלי כותרות.`
+    " פלט לפי MORNING BRIEF: שורת מזג אוויר, ואז כל המשימות הפתוחות מקובצות לפי תחום (💼 דינמיקה / 🚗 רכב דינמיקה / 🚴 SPINZ / 💍 תכשיטים / 🏡 בית / 🏠 סולשיין), ממוין 🔴 קודם, כל משימה בשורה. דלג על תחום ריק. הוסף שורת התרעה אחת + הצעת time-block. בלי טבלאות, בלי כותרות, בלי שאלת סיום."
   );
 }
 cron.schedule("0 7 * * *", () => {
@@ -997,16 +953,16 @@ cron.schedule("*/30 * * * *", async () => {
 // 12:30 — midday check (3 lines max)
 cron.schedule("30 12 * * *", () => {
   sendScheduled(
-    "צ'ק צהריים. הרץ get_daily_focus + get_tasks. פלט 3 שורות מקסימום: " +
-    "🎯 X/3 | ⚠️ המשימה הכי תקועה + 'מה חוסם?' | אם הכל בסדר — רק '✅ במסלול. 🎯 X/3'."
+    "צ'ק צהריים. הרץ get_tasks. פלט 3 שורות מקסימום: " +
+    "⚠️ המשימה הכי תקועה + 'מה חוסם?' | כמה משימות באיחור | אם הכל בסדר — רק '✅ במסלול'."
   );
 }, { timezone: "Asia/Jerusalem" });
 
 // 22:00 — evening review (6 lines max)
 cron.schedule("0 22 * * *", () => {
   sendScheduled(
-    "סיכום ערב. הרץ get_daily_focus + get_productivity_stats. פלט 6 שורות מקסימום: " +
-    "🎯 ציון פוקוס X/3 | ✅ מה הושלם (שורה) | 📌 Top 2 למחר (2 שורות) | שאלה: מה ההצלחה של היום?"
+    "סיכום ערב. הרץ get_productivity_stats + get_tasks. פלט 5 שורות מקסימום: " +
+    "✅ מה הושלם היום (שורה) | 📌 Top 3 משימות למחר לפי דחיפות (3 שורות) | שאלה אחת קצרה."
   );
 }, { timezone: "Asia/Jerusalem" });
 
@@ -1020,7 +976,7 @@ cron.schedule("0 8 * * 0", () => {
     (extras.length ? ` + ${extras.join(" + ")}` : "") +
     ". פלט 10 שורות מקסימום: " +
     "📈 velocity מול שבוע שעבר (שורה) | 🎯 3 יעדים לשבוע (3 שורות, לפי backlog) | " +
-    "🕐 2 time-blocks מוצעים (2 שורות) | שאלה: מה היעד הכי חשוב השבוע?"
+    "🕐 2 time-blocks מוצעים (2 שורות)"
   );
 }, { timezone: "Asia/Jerusalem" });
 
@@ -1053,7 +1009,7 @@ bot.command("start", async (ctx) => {
   histories.delete(ctx.chat.id);
   wizardStates.delete(ctx.chat.id);
   return ctx.reply(
-    "מוכן לפעולה.\n\n*תחומים:* 🚴 SPINZ | 💍 תכשיטים | 💼 דינמיקה | 🏡 בית | 🏠 סולשיין\n\n*לו\"ז אוטומטי:*\n🌅 07:00 בריף בוקר + פוקוס\n🕐 12:30 צ'ק צהריים\n🌙 22:00 סיכום ערב\n📅 ראשון 08:00 תכנון שבוע\n📊 שישי 14:00 סקירת שבוע",
+    "מוכן לפעולה.\n\n*תחומים:* 🚴 SPINZ | 💍 תכשיטים | 💼 דינמיקה | 🚗 רכב דינמיקה | 🏡 בית | 🏠 סולשיין\n\n*לו\"ז אוטומטי:*\n🌅 07:00 בריף בוקר (כל המשימות)\n🕐 12:30 צ'ק צהריים\n🌙 22:00 סיכום ערב\n📅 ראשון 08:00 תכנון שבוע\n📊 שישי 14:00 סקירת שבוע",
     { parse_mode: "Markdown", reply_markup: MAIN_KEYBOARD }
   );
 });
@@ -1086,8 +1042,8 @@ bot.hears("📊 בריף", async (ctx) => {
   const stopTyping = keepTyping(ctx);
   try {
     const reply = await runAgent(ctx.chat.id,
-      "בריף מיידי. הרץ במקביל: get_daily_focus, מזג אוויר, יומן היום, get_tasks, מיילים. " +
-      "פלט לפי BRIEF TEMPLATE בדיוק — 12 שורות מקסימום."
+      "בריף מיידי. הרץ במקביל: get_tasks (כל הרשימות), מזג אוויר, יומן היום, מיילים. " +
+      "פלט לפי MORNING BRIEF: כל המשימות הפתוחות מקובצות לפי תחום, ממוין 🔴 קודם, + התרעה אחת. בלי שאלת סיום."
     );
     stopTyping();
     await safeSend(ctx.chat.id, reply);
@@ -1117,20 +1073,6 @@ bot.hears("📧 מיילים", async (ctx) => {
     stopTyping();
     await safeSend(ctx.chat.id, reply);
   } catch (err) { stopTyping(); await ctx.reply(`שגיאה: ${err instanceof Error ? err.message : String(err)}`); }
-});
-
-bot.hears("🎯 פוקוס", async (ctx) => {
-  const focus = await getTodayFocus();
-  if (focus) {
-    const doneCount = focus.items.filter((i) => i.done).length;
-    return ctx.reply(
-      `🎯 *הפוקוס של היום* (${doneCount}/${focus.items.length}):\n\n${formatFocus(focus)}\n\n_סיימת אחת? כתוב "סיימתי 1" / "סיימתי 2"_`,
-      { parse_mode: "Markdown", reply_markup: MAIN_KEYBOARD }
-    );
-  }
-  // No focus yet — capture the next message DIRECTLY as focus items (deterministic, no agent).
-  wizardStates.set(ctx.chat.id, { type: "focus", stage: "items" });
-  await ctx.reply("עוד לא הגדרת פוקוס להיום.\n\nמה 3 הדברים שחייבים לקרות היום? (כתוב אותם בהודעה אחת, שורה לכל אחד)");
 });
 
 bot.hears("📈 נתונים", async (ctx) => {
@@ -1513,23 +1455,6 @@ async function handleWizard(chatId: number, text: string, state: WizardState): P
     }
   }
 
-  if (state.type === "focus") {
-    wizardStates.delete(chatId);
-    // Parse one item per line; strip leading bullets/dashes/numbers. Take up to 3.
-    const items = text
-      .split("\n")
-      .map((l) => l.replace(/^\s*[-•*\d.)]+\s*/, "").trim())
-      .filter(Boolean)
-      .slice(0, 3);
-    if (items.length === 0) {
-      await bot.api.sendMessage(chatId, "לא זיהיתי משימות — נסה שוב עם 🎯 פוקוס.");
-      return;
-    }
-    const f = await setTodayFocus(items);
-    await bot.api.sendMessage(chatId, `🎯 הפוקוס של היום נקבע:\n\n${formatFocus(f)}\n\n_סיימת אחת? כתוב "סיימתי 1"._`, { parse_mode: "Markdown", reply_markup: MAIN_KEYBOARD });
-    return;
-  }
-
   if (state.type === "newlist") {
     wizardStates.delete(chatId);
     const name = text.trim();
@@ -1617,8 +1542,8 @@ bot.command("brief", async (ctx) => {
   try {
     const reply = await runAgent(
       ctx.chat.id,
-      "בריף מיידי. הרץ במקביל: get_daily_focus, מזג אוויר, יומן היום, get_tasks, מיילים. " +
-      "פלט לפי BRIEF TEMPLATE בדיוק — 12 שורות מקסימום."
+      "בריף מיידי. הרץ במקביל: get_tasks (כל הרשימות), מזג אוויר, יומן היום, מיילים. " +
+      "פלט לפי MORNING BRIEF: כל המשימות הפתוחות מקובצות לפי תחום, ממוין 🔴 קודם, + התרעה אחת. בלי שאלת סיום."
     );
     stopTyping();
     await safeSend(ctx.chat.id, reply);
@@ -1626,19 +1551,6 @@ bot.command("brief", async (ctx) => {
     stopTyping();
     await ctx.reply(`שגיאה: ${err instanceof Error ? err.message : String(err)}`);
   }
-});
-
-bot.command("focus", async (ctx) => {
-  const focus = await getTodayFocus();
-  if (focus) {
-    const doneCount = focus.items.filter((i) => i.done).length;
-    return ctx.reply(
-      `🎯 *הפוקוס של היום* (${doneCount}/${focus.items.length}):\n\n${formatFocus(focus)}`,
-      { parse_mode: "Markdown", reply_markup: MAIN_KEYBOARD }
-    );
-  }
-  wizardStates.set(ctx.chat.id, { type: "focus", stage: "items" });
-  return ctx.reply("עוד לא הגדרת פוקוס להיום.\n\nמה 3 הדברים שחייבים לקרות היום? (שורה לכל אחד)");
 });
 
 bot.command("review", async (ctx) => {
