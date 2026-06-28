@@ -192,11 +192,19 @@ function scheduleReminder(r: Reminder): void {
   scheduledTimeouts.set(r.id, timeout);
 }
 
+// Short-lived store so snooze/done buttons can recover the reminder text after firing.
+const recentlyFired = new Map<string, { chatId: number; text: string }>();
+
 async function fireReminder(r: Reminder): Promise<void> {
   scheduledTimeouts.delete(r.id);
   await deleteReminder(r.id);
   try {
-    await bot.api.sendMessage(r.chatId, `⏰ תזכורת: ${r.text}`);
+    recentlyFired.set(r.id, { chatId: r.chatId, text: r.text });
+    await bot.api.sendMessage(r.chatId, `⏰ תזכורת: ${r.text}`, {
+      reply_markup: new InlineKeyboard()
+        .text("✅ בוצע", `rem:done:${r.id}`).row()
+        .text("⏰ +שעה", `rem:snz:${r.id}:60`).text("⏰ מחר 9", `rem:snz:${r.id}:tm`).text("🔕", `rem:x:${r.id}`),
+    });
     console.log(`[reminder:fired] ${r.id} — "${r.text}"`);
   } catch (err) {
     console.error(`[reminder:error] ${r.id}:`, err);
@@ -248,6 +256,74 @@ async function findFreeSlots(
 function toIsrael(d: Date): string {
   // DST-aware Israel ISO string (delegates to the shared time helper)
   return toIsraelISO(d);
+}
+
+// ── Proactive auto-place on capture ───────────────────────────────────────────
+// The behavior that flips "passive secretary that logs" → "staff that schedules".
+// On capture we propose a concrete free slot and let the user place it in one tap.
+
+interface SlotSuggestion { chatId: number; title: string; durationMin: number; startISO: string; endISO: string }
+const pendingSlots = new Map<string, SlotSuggestion>();
+// Tracks tasks added during the current message turn, to offer scheduling after.
+const lastAddedTask = new Map<number, { title: string; priority: string; count: number }>();
+
+const PRIORITY_EMOJI = ["🔴", "🟡", "🟠", "⚪"];
+function priorityOf(title: string): string {
+  const first = [...title][0];
+  return PRIORITY_EMOJI.includes(first) ? first : "";
+}
+
+function addDaysDate(dateStr: string, n: number): string {
+  const d = new Date(`${dateStr}T12:00:00Z`); // noon-UTC anchor → DST-safe
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+function roundUpHalfHour(d: Date): Date {
+  const ms = 30 * 60 * 1000;
+  return new Date(Math.ceil(d.getTime() / ms) * ms);
+}
+function hhmm(iso: string): string { return iso.slice(11, 16); }
+function heDay(iso: string): string {
+  return new Date(iso).toLocaleDateString("he-IL", { timeZone: "Asia/Jerusalem", weekday: "short", day: "numeric", month: "numeric" });
+}
+
+/** First viable free block today (if time left) or tomorrow, sized by priority. */
+async function suggestSlot(priorityEmoji: string): Promise<{ startISO: string; endISO: string; durationMin: number } | null> {
+  const durationMin = priorityEmoji === "🔴" ? 60 : 45;
+  const today = israelDate();
+  const nowHour = Number(israelNowISO().slice(11, 13));
+  const dates = nowHour < 18 ? [today, addDaysDate(today, 1)] : [addDaysDate(today, 1)];
+  const now = new Date();
+  for (const date of dates) {
+    const slots = await findFreeSlots(date, durationMin).catch(() => []);
+    for (const s of slots) {
+      let start = new Date(s.start);
+      const end = new Date(s.end);
+      if (date === today && start.getTime() < now.getTime() + 10 * 60000) {
+        start = roundUpHalfHour(new Date(now.getTime() + 10 * 60000));
+      }
+      if (end.getTime() - start.getTime() >= durationMin * 60000) {
+        const slotEnd = new Date(start.getTime() + durationMin * 60000);
+        return { startISO: toIsraelISO(start), endISO: toIsraelISO(slotEnd), durationMin };
+      }
+    }
+  }
+  return null;
+}
+
+/** After a task is captured, offer to place it on the calendar (one-tap). */
+async function offerScheduling(chatId: number, title: string, priorityEmoji: string): Promise<void> {
+  const sug = await suggestSlot(priorityEmoji).catch(() => null);
+  if (!sug) return; // no free slot → stay silent, task is already on the list
+  const token = `sl_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+  pendingSlots.set(token, { chatId, title, durationMin: sug.durationMin, startISO: sug.startISO, endISO: sug.endISO });
+  const when = `${heDay(sug.startISO)} ${hhmm(sug.startISO)}–${hhmm(sug.endISO)}`;
+  await bot.api.sendMessage(chatId, `🗓️ מתי לעבוד על זה?\nהצעה: *${when}*`, {
+    parse_mode: "Markdown",
+    reply_markup: new InlineKeyboard()
+      .text(`✅ קבע ${hhmm(sug.startISO)}`, `sched:ok:${token}`).row()
+      .text("🕐 זמן אחר", `sched:alt:${token}`).text("📋 רק ברשימה", `sched:skip:${token}`),
+  });
 }
 
 // ── Tool definitions ──────────────────────────────────────────────────────────
@@ -511,11 +587,13 @@ async function executeTool(name: string, input: Record<string, unknown>, chatId:
     switch (name) {
       case "get_tasks":
         out = JSON.stringify(await getTasks(input.listName as string | undefined), null, 2); break;
-      case "add_task":
-        out = JSON.stringify(
-          await addTask(input.title as string, input.listName as string | undefined, input.due as string | undefined, input.notes as string | undefined),
-          null, 2
-        ); break;
+      case "add_task": {
+        const added = await addTask(input.title as string, input.listName as string | undefined, input.due as string | undefined, input.notes as string | undefined);
+        // Remember it so the message handler can offer one-tap scheduling after the reply.
+        const prev = lastAddedTask.get(chatId);
+        lastAddedTask.set(chatId, { title: added.title, priority: priorityOf(added.title), count: (prev?.count ?? 0) + 1 });
+        out = JSON.stringify(added, null, 2); break;
+      }
       case "complete_task": {
         const done = await completeTask(input.taskId as string, input.listId as string);
         await logCompletion(done.title, done.listTitle);
@@ -711,10 +789,11 @@ ${dateRef}
 - אם אינך בטוח בפרט — שאל, אל תמציא.
 - אל תאשר פעולה שלא בוצעה בפועל דרך כלי.
 
-## CORE PHILOSOPHY — you are NOT a data collector. You are a thinking partner.
-- Never just list data. Always: analyze → prioritize → surface insights → ask ONE focused question.
-- Your job is to help the user decide what to do next, not just to remember what they said.
-- After EVERY action, leave no open loop: follow up, flag a risk, or ask a clarifying question.
+## CORE PHILOSOPHY — chief of staff, NOT a passive secretary.
+- Don't just log what you're told — PLACE it, PREPARE it, CHASE it. Be proactive.
+- After capturing a task, the system already offers to schedule it (calendar buttons) — don't ask "מתי הדדליין", let the buttons handle timing.
+- Anticipate the next step and surface it. Protect the user's time. Close open loops.
+- ONE sharp clarifying question only when genuinely ambiguous ("איזה צוות?" with options). Never an interrogation, never a silent wrong guess. If you can infer, infer.
 
 ## TELEGRAM FORMAT — HARD RULES (messages render as plain text on a phone):
 - NEVER use markdown tables, NEVER use --- separators, NEVER use ## headers.
@@ -1311,6 +1390,91 @@ bot.callbackQuery(/^ldelyes:(\d+)$/, async (ctx) => {
   }
 });
 
+// ── Proactive scheduling callbacks (auto-place on capture) ────────────────────
+
+async function placeOnCalendar(ctx: Context, title: string, startISO: string, endISO: string): Promise<void> {
+  await addCalendarEvent(title, startISO, endISO);
+  await ctx.editMessageText(`✅ ביומן: ${title}\n🗓️ ${heDay(startISO)} ${hhmm(startISO)}–${hhmm(endISO)}`);
+}
+
+bot.callbackQuery(/^sched:ok:(.+)$/, async (ctx) => {
+  const s = pendingSlots.get(ctx.match[1]);
+  await ctx.answerCallbackQuery(s ? { text: "✅ נקבע" } : { text: "פג תוקף" });
+  if (!s) return;
+  pendingSlots.delete(ctx.match[1]);
+  try { await placeOnCalendar(ctx, s.title, s.startISO, s.endISO); }
+  catch (err) { await ctx.editMessageText(`❌ שגיאה בשיבוץ: ${err instanceof Error ? err.message : String(err)}`); }
+});
+
+bot.callbackQuery(/^sched:skip:(.+)$/, async (ctx) => {
+  pendingSlots.delete(ctx.match[1]);
+  await ctx.answerCallbackQuery();
+  await ctx.editMessageText("📋 נשאר ברשימה (ללא שיבוץ ביומן).");
+});
+
+bot.callbackQuery(/^sched:alt:(.+)$/, async (ctx) => {
+  const token = ctx.match[1];
+  const s = pendingSlots.get(token);
+  await ctx.answerCallbackQuery();
+  if (!s) { await ctx.editMessageText("פג תוקף — נסה להוסיף שוב."); return; }
+  const today = israelDate();
+  const off = israelOffsetStr();
+  const nowHour = Number(israelNowISO().slice(11, 13));
+  const kb = new InlineKeyboard();
+  if (nowHour < 17) kb.text("היום 18:00", `sched:set:${token}:${today}T18:00:00${off}`).row();
+  kb.text("מחר 09:00", `sched:set:${token}:${addDaysDate(today, 1)}T09:00:00${off}`)
+    .text("מחר 14:00", `sched:set:${token}:${addDaysDate(today, 1)}T14:00:00${off}`).row();
+  kb.text("📋 רק ברשימה", `sched:skip:${token}`);
+  await ctx.editMessageText(`🕐 בחר זמן ל-"${s.title}":`, { reply_markup: kb });
+});
+
+bot.callbackQuery(/^sched:set:([^:]+):(.+)$/, async (ctx) => {
+  const token = ctx.match[1];
+  const startISO = ctx.match[2];
+  const s = pendingSlots.get(token);
+  await ctx.answerCallbackQuery(s ? { text: "✅ נקבע" } : { text: "פג תוקף" });
+  if (!s) return;
+  pendingSlots.delete(token);
+  const endISO = toIsraelISO(new Date(new Date(startISO).getTime() + s.durationMin * 60000));
+  try { await placeOnCalendar(ctx, s.title, startISO, endISO); }
+  catch (err) { await ctx.editMessageText(`❌ שגיאה בשיבוץ: ${err instanceof Error ? err.message : String(err)}`); }
+});
+
+// ── Reminder action callbacks (done / snooze / dismiss) ───────────────────────
+
+bot.callbackQuery(/^rem:done:(.+)$/, async (ctx) => {
+  recentlyFired.delete(ctx.match[1]);
+  await ctx.answerCallbackQuery({ text: "✅ יופי" });
+  await ctx.editMessageText(`✅ בוצע: ${(ctx.callbackQuery.message?.text ?? "").replace(/^⏰ תזכורת: /, "")}`);
+});
+
+bot.callbackQuery(/^rem:x:(.+)$/, async (ctx) => {
+  recentlyFired.delete(ctx.match[1]);
+  await ctx.answerCallbackQuery();
+  await ctx.editMessageText(`🔕 בוטל: ${(ctx.callbackQuery.message?.text ?? "").replace(/^⏰ תזכורת: /, "")}`);
+});
+
+bot.callbackQuery(/^rem:snz:([^:]+):(.+)$/, async (ctx) => {
+  const id = ctx.match[1];
+  const mode = ctx.match[2];
+  const info = recentlyFired.get(id);
+  await ctx.answerCallbackQuery(info ? { text: "⏰ נדחה" } : { text: "פג תוקף" });
+  if (!info) return;
+  recentlyFired.delete(id);
+  let fireAt: Date, label: string;
+  if (mode === "tm") {
+    const tm = addDaysDate(israelDate(), 1);
+    fireAt = new Date(`${tm}T09:00:00${israelOffsetStr()}`);
+    label = "מחר 09:00";
+  } else {
+    fireAt = new Date(Date.now() + Number(mode) * 60000);
+    label = `${Number(mode)} דקות`;
+  }
+  const nr: Reminder = { id: `r_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`, chatId: info.chatId, text: info.text, fireAt: fireAt.toISOString() };
+  await upsertReminder(nr); scheduleReminder(nr);
+  await ctx.editMessageText(`⏰ נדחה (${label}): ${info.text}`);
+});
+
 // ── Inline keyboard callbacks ─────────────────────────────────────────────────
 
 bot.callbackQuery(/^dom:(.+)$/, async (ctx) => {
@@ -1393,9 +1557,11 @@ async function doAddTask(chatId: number, name: string, listName: string, dueText
     const dueStr = dueIso ? ` | 📅 ${new Date(dueIso).toLocaleDateString("he-IL", { timeZone: "Asia/Jerusalem" })}` : "";
     const domLabel = DOMAIN_OPTIONS.find(d => d.list === listName)?.label ?? listName;
     await bot.api.sendMessage(chatId,
-      `✅ נוסף: *${task.title}*\n${domLabel}${dueStr}\n\nמה הדדליין הסופי? כמה זמן לוקח לך?`,
+      `✅ נוסף: *${task.title}*\n${domLabel}${dueStr}`,
       { parse_mode: "Markdown", reply_markup: MAIN_KEYBOARD }
     );
+    // Proactive: offer to place it on the calendar in one tap.
+    await offerScheduling(chatId, task.title, priorityOf(task.title));
   } catch (err) {
     await bot.api.sendMessage(chatId, `❌ שגיאה בהוספת משימה: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -1652,6 +1818,7 @@ bot.on("message:voice", async (ctx) => {
   try {
     const transcript = await transcribeVoice(ctx.message.voice.file_id);
     if (!transcript) { stopTyping(); return ctx.reply("לא הצלחתי להבין את ההקלטה, נסה שוב."); }
+    lastAddedTask.delete(ctx.chat.id); // reset turn tracker
     // Voice notes are often a brain-dump — instruct full entity extraction + parallel execution
     const reply = await runAgent(
       ctx.chat.id,
@@ -1662,6 +1829,7 @@ bot.on("message:voice", async (ctx) => {
     );
     stopTyping();
     await safeSend(ctx.chat.id, `🎙 "${transcript}"\n\n${reply}`);
+    await maybeOfferScheduling(ctx.chat.id);
   } catch (err) {
     stopTyping();
     await ctx.reply(`שגיאה בתמלול: ${err instanceof Error ? err.message : String(err)}`);
@@ -1701,6 +1869,16 @@ bot.on("message:photo", async (ctx) => {
   }
 });
 
+/** If exactly one task was captured this turn, proactively offer to place it on the calendar. */
+async function maybeOfferScheduling(chatId: number): Promise<void> {
+  const added = lastAddedTask.get(chatId);
+  lastAddedTask.delete(chatId);
+  if (added && added.count === 1) {
+    await offerScheduling(chatId, added.title, added.priority).catch((e) =>
+      console.error("[schedule:offer] failed:", e instanceof Error ? e.message : e));
+  }
+}
+
 bot.on("message:text", async (ctx) => {
   const chatId = ctx.chat.id;
   const text = ctx.message.text;
@@ -1717,10 +1895,12 @@ bot.on("message:text", async (ctx) => {
   await ctx.replyWithChatAction("typing");
   const stopTyping = keepTyping(ctx);
 
+  lastAddedTask.delete(chatId); // reset turn tracker
   try {
     const reply = await runAgent(chatId, text);
     stopTyping();
     await safeSend(chatId, reply);
+    await maybeOfferScheduling(chatId);
   } catch (err) {
     stopTyping();
     const msg = err instanceof Error ? err.message : String(err);
