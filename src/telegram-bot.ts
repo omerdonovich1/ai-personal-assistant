@@ -55,8 +55,8 @@ const scheduledTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
 
 const MAIN_KEYBOARD = new Keyboard()
   .text("➕ משימה").text("📋 משימות").text("📅 אירוע").row()
-  .text("⏰ תזכורת").text("📊 בריף").text("✅ סקירה").row()
-  .text("📧 מיילים").text("📈 נתונים")
+  .text("⏰ תזכורת").text("🗓️ תכנן").text("📊 בריף").row()
+  .text("✅ סקירה").text("📧 מיילים").text("📈 נתונים")
   .resized()
   .persistent();
 
@@ -264,6 +264,8 @@ function toIsrael(d: Date): string {
 
 interface SlotSuggestion { chatId: number; title: string; durationMin: number; startISO: string; endISO: string }
 const pendingSlots = new Map<string, SlotSuggestion>();
+interface PlanBlock { title: string; startISO: string; endISO: string }
+const dayPlans = new Map<string, { chatId: number; blocks: PlanBlock[] }>();
 // Tracks tasks added during the current message turn, to offer scheduling after.
 const lastAddedTask = new Map<number, { title: string; priority: string; count: number }>();
 
@@ -323,6 +325,69 @@ async function offerScheduling(chatId: number, title: string, priorityEmoji: str
     reply_markup: new InlineKeyboard()
       .text(`✅ קבע ${hhmm(sug.startISO)}`, `sched:ok:${token}`).row()
       .text("🕐 זמן אחר", `sched:alt:${token}`).text("📋 רק ברשימה", `sched:skip:${token}`),
+  });
+}
+
+// ── Plan-my-day ritual ────────────────────────────────────────────────────────
+// Greedily timeboxes the top open tasks into today's free gaps (🔴 first),
+// presents the whole plan, and places it all on the calendar in one tap.
+
+const PRIORITY_RANK: Record<string, number> = { "🔴": 0, "🟡": 1, "🟠": 2, "⚪": 3, "": 4 };
+
+/** All free gaps left in today's workday (after now), ≥ minMinutes. */
+async function freeGapsToday(minMinutes = 30): Promise<Array<{ start: Date; end: Date }>> {
+  const date = israelDate();
+  const slots = await findFreeSlots(date, minMinutes).catch(() => []);
+  const floor = new Date(Date.now() + 10 * 60000);
+  return slots
+    .map((s) => ({ start: new Date(s.start), end: new Date(s.end) }))
+    .map((g) => (g.start < floor ? { start: roundUpHalfHour(floor), end: g.end } : g))
+    .filter((g) => g.end.getTime() - g.start.getTime() >= minMinutes * 60000);
+}
+
+async function buildDayPlan(chatId: number): Promise<{ text: string; token: string; count: number } | null> {
+  const open = (await getTasks()).filter((t) => t.status === "needsAction");
+  if (open.length === 0) return null;
+  const top = open
+    .sort((a, b) => (PRIORITY_RANK[priorityOf(a.title)] ?? 4) - (PRIORITY_RANK[priorityOf(b.title)] ?? 4))
+    .slice(0, 3);
+
+  const gaps = await freeGapsToday(30);
+  const blocks: PlanBlock[] = [];
+  let ti = 0;
+  for (const g of gaps) {
+    let cur = new Date(g.start);
+    while (ti < top.length) {
+      const durMs = (priorityOf(top[ti].title) === "🔴" ? 60 : 45) * 60000;
+      if (cur.getTime() + durMs <= g.end.getTime()) {
+        const end = new Date(cur.getTime() + durMs);
+        blocks.push({ title: top[ti].title, startISO: toIsraelISO(cur), endISO: toIsraelISO(end) });
+        cur = new Date(end.getTime() + 10 * 60000); // 10-min buffer between blocks
+        ti++;
+      } else break;
+    }
+    if (ti >= top.length) break;
+  }
+  if (blocks.length === 0) return null;
+
+  const token = `pl_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+  dayPlans.set(token, { chatId, blocks });
+  const lines = blocks.map((b, i) => `${i + 1}. ${b.title.slice(0, 40)} → ${hhmm(b.startISO)}–${hhmm(b.endISO)}`);
+  const leftover = top.length - blocks.length;
+  const note = leftover > 0 ? `\n\n(${leftover} משימות ללא משבצת פנויה היום)` : "";
+  return { text: `🗓️ התוכנית להיום:\n${lines.join("\n")}${note}`, token, count: blocks.length };
+}
+
+async function sendDayPlan(chatId: number): Promise<void> {
+  const plan = await buildDayPlan(chatId).catch(() => null);
+  if (!plan) {
+    await bot.api.sendMessage(chatId, "אין משימות פתוחות לשבץ, או שאין חלונות פנויים היום. 🎉", { reply_markup: MAIN_KEYBOARD });
+    return;
+  }
+  await bot.api.sendMessage(chatId, plan.text, {
+    reply_markup: new InlineKeyboard()
+      .text(`✅ קבע הכל ביומן (${plan.count})`, `plan:ok:${plan.token}`).row()
+      .text("📋 לא עכשיו", `plan:skip:${plan.token}`),
   });
 }
 
@@ -1016,8 +1081,14 @@ function morningBriefPrompt(): string {
     " פלט לפי MORNING BRIEF: שורת מזג אוויר, ואז כל המשימות הפתוחות מקובצות לפי תחום (💼 דינמיקה / 🚗 רכב דינמיקה / 🚴 SPINZ / 💍 תכשיטים / 🏡 בית / 🏠 סולשיין), ממוין 🔴 קודם, כל משימה בשורה. דלג על תחום ריק. הוסף שורת התרעה אחת + הצעת time-block. בלי טבלאות, בלי כותרות, בלי שאלת סיום."
   );
 }
-cron.schedule("0 7 * * *", () => {
-  sendScheduled(morningBriefPrompt());
+cron.schedule("0 7 * * *", async () => {
+  await sendScheduled(morningBriefPrompt());
+  // Offer the one-tap planning ritual right after the brief.
+  if (registeredChatId) {
+    await bot.api.sendMessage(registeredChatId, "רוצה שאשבץ את המשימות החשובות ביומן של היום?", {
+      reply_markup: new InlineKeyboard().text("🗓️ תכנן את היום", "plan:start"),
+    }).catch(() => {});
+  }
 }, { timezone: "Asia/Jerusalem" });
 
 // Every 30 min — refresh tasks snapshot for the dashboard (Postgres only)
@@ -1127,6 +1198,12 @@ bot.hears("📊 בריף", async (ctx) => {
     stopTyping();
     await safeSend(ctx.chat.id, reply);
   } catch (err) { stopTyping(); await ctx.reply(`שגיאה: ${err instanceof Error ? err.message : String(err)}`); }
+});
+
+bot.hears("🗓️ תכנן", async (ctx) => {
+  await ctx.replyWithChatAction("typing");
+  try { await sendDayPlan(ctx.chat.id); }
+  catch (err) { await ctx.reply(`שגיאה: ${err instanceof Error ? err.message : String(err)}`); }
 });
 
 bot.hears("✅ סקירה", async (ctx) => {
@@ -1440,6 +1517,36 @@ bot.callbackQuery(/^sched:set:([^:]+):(.+)$/, async (ctx) => {
   catch (err) { await ctx.editMessageText(`❌ שגיאה בשיבוץ: ${err instanceof Error ? err.message : String(err)}`); }
 });
 
+// ── Plan-my-day callbacks ─────────────────────────────────────────────────────
+
+bot.callbackQuery(/^plan:ok:(.+)$/, async (ctx) => {
+  const plan = dayPlans.get(ctx.match[1]);
+  await ctx.answerCallbackQuery(plan ? { text: "✅ נקבע ביומן" } : { text: "פג תוקף" });
+  if (!plan) return;
+  dayPlans.delete(ctx.match[1]);
+  let ok = 0;
+  for (const b of plan.blocks) {
+    try { await addCalendarEvent(b.title, b.startISO, b.endISO); ok++; }
+    catch (err) { console.error("[plan] event failed:", err instanceof Error ? err.message : err); }
+  }
+  const lines = plan.blocks.map((b) => `✅ ${b.title.slice(0, 40)} — ${hhmm(b.startISO)}–${hhmm(b.endISO)}`);
+  await ctx.editMessageText(`🗓️ ${ok} בלוקים נקבעו ביומן:\n${lines.join("\n")}`);
+});
+
+bot.callbackQuery(/^plan:skip:(.+)$/, async (ctx) => {
+  dayPlans.delete(ctx.match[1]);
+  await ctx.answerCallbackQuery();
+  await ctx.editMessageText("📋 בסדר — התוכנית לא שובצה ביומן.");
+});
+
+bot.callbackQuery("plan:start", async (ctx) => {
+  const chatId = ctx.chat?.id;
+  await ctx.answerCallbackQuery();
+  if (!chatId) return;
+  await ctx.editMessageText("🗓️ בונה תוכנית…");
+  await sendDayPlan(chatId).catch((e) => console.error("[plan:start]", e));
+});
+
 // ── Reminder action callbacks (done / snooze / dismiss) ───────────────────────
 
 bot.callbackQuery(/^rem:done:(.+)$/, async (ctx) => {
@@ -1700,6 +1807,12 @@ bot.command("reminders", async (ctx) => {
   if (!mine.length) return ctx.reply("אין תזכורות ממתינות.");
   const lines = mine.map((r) => `• ${r.text} — ${new Date(r.fireAt).toLocaleString("he-IL", { timeZone: "Asia/Jerusalem" })}`);
   return ctx.reply(`⏰ תזכורות ממתינות:\n\n${lines.join("\n")}`);
+});
+
+bot.command("plan", async (ctx) => {
+  await ctx.replyWithChatAction("typing");
+  try { await sendDayPlan(ctx.chat.id); }
+  catch (err) { await ctx.reply(`שגיאה: ${err instanceof Error ? err.message : String(err)}`); }
 });
 
 bot.command("brief", async (ctx) => {
