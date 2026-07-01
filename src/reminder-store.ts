@@ -9,9 +9,10 @@ const __dirname = dirname(__filename);
 const DATA_DIR = join(__dirname, "..", "data");
 const FILE = join(DATA_DIR, "reminders.json");
 
-/** Optional payload that changes how a reminder fires (e.g. progress check-ins). */
+/** Optional payload that changes how a reminder fires (progress check-ins,
+ *  post-meeting follow-ups). */
 export interface ReminderMeta {
-  kind: "checkin";
+  kind: "checkin" | "event_followup";
   taskId?: string;
   listId?: string;
 }

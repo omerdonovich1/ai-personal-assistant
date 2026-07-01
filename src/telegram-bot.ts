@@ -99,7 +99,8 @@ type WizardState =
   | { type: "event";    stage: "datetime"; title: string }
   | { type: "reminder"; stage: "text" }
   | { type: "reminder"; stage: "time";  text: string }
-  | { type: "newlist";  stage: "name" };
+  | { type: "newlist";  stage: "name" }
+  | { type: "postevent"; stage: "tasks"; eventTitle: string };
 
 const wizardStates = new Map<number, WizardState>();
 
@@ -203,6 +204,17 @@ async function fireReminder(r: Reminder): Promise<void> {
   scheduledTimeouts.delete(r.id);
   await deleteReminder(r.id);
   try {
+    if (r.meta?.kind === "event_followup") {
+      postEventPending.set(r.id, { chatId: r.chatId, title: r.text });
+      await bot.api.sendMessage(r.chatId, `📋 *${r.text}* הסתיימה.\nיצאו משימות? משהו לתעד?`, {
+        parse_mode: "Markdown",
+        reply_markup: new InlineKeyboard()
+          .text("➕ יש משימות להוסיף", `evt:add:${r.id}`).row()
+          .text("✅ אין כלום", `evt:none:${r.id}`).text("🔕 אל תשאל על זה", `evt:mute:${r.id}`),
+      });
+      console.log(`[event-followup:fired] "${r.text}"`);
+      return;
+    }
     if (r.meta?.kind === "checkin") {
       // Progress check-in on a scheduled work block
       pendingCheckIns.set(r.id, {
@@ -486,6 +498,47 @@ async function sendTodayTimeline(chatId: number): Promise<void> {
   await bot.api.sendMessage(chatId, text, {
     reply_markup: new InlineKeyboard().text("🗓️ שבץ את הלא-משובצות", "plan:start"),
   });
+}
+
+// ── Calendar-aware day companion ──────────────────────────────────────────────
+// Follows the user's REAL calendar: when a meeting/event ends, ask what came
+// out of it (new tasks? done?). Anti-spam by design: skips all-day events,
+// long anchor blocks (>3h), bot-placed task blocks (they get check-ins), and
+// titles the user muted with 🔕. Dedup via reminder ids keyed to the event id.
+
+const postEventPending = new Map<string, { chatId: number; title: string }>();
+
+async function getMutedEventTitles(): Promise<Set<string>> {
+  const facts = await loadUserFacts("_system").catch(() => []);
+  return new Set(
+    facts.filter((f) => f.context === "_system" && f.key.startsWith("mute:")).map((f) => f.key.slice(5))
+  );
+}
+
+async function pollEventFollowups(): Promise<void> {
+  if (!registeredChatId) return;
+  const date = israelDate();
+  const off = israelOffsetStr();
+  const events = await getCalendarEvents(`${date}T00:00:00${off}`, `${date}T23:59:59${off}`);
+  const muted = await getMutedEventTitles();
+  for (const e of events) {
+    if (!e.start || !e.end || !e.start.includes("T")) continue; // all-day → skip
+    const endMs = new Date(e.end).getTime();
+    const durMs = endMs - new Date(e.start).getTime();
+    if (durMs > 3 * 3600_000) continue;                    // long anchor blocks → skip
+    if (PRIORITY_EMOJI.includes([...e.summary][0])) continue; // bot task block → has its own check-in
+    if (muted.has(normalizeTitle(e.summary))) continue;    // user muted this title
+    if (endMs <= Date.now()) continue;                     // already over — don't backfill spam
+    const id = `evtf_${e.id}`;
+    if (scheduledTimeouts.has(id)) continue;               // already armed this run
+    const r: Reminder = {
+      id, chatId: registeredChatId, text: e.summary,
+      fireAt: new Date(endMs).toISOString(),
+      meta: { kind: "event_followup" },
+    };
+    await upsertReminder(r); // idempotent on id → survives restarts without duplicates
+    scheduleReminder(r);
+  }
 }
 
 // ── "מה עכשיו" — rapid execution loop ─────────────────────────────────────────
@@ -1329,12 +1382,31 @@ cron.schedule("*/30 * * * *", async () => {
   }
 }, { timezone: "Asia/Jerusalem" });
 
+// Every 15 min (07:00–21:00) — arm post-event follow-ups from the live calendar
+cron.schedule("*/15 7-21 * * *", async () => {
+  try {
+    await pollEventFollowups();
+  } catch (err) {
+    console.error("[event-followup:poll] failed:", err instanceof Error ? err.message : err);
+  }
+}, { timezone: "Asia/Jerusalem" });
+
 // 12:30 — midday check (3 lines max)
 cron.schedule("30 12 * * *", () => {
-  sendScheduled(
-    "צ'ק צהריים. הרץ get_tasks. פלט 3 שורות מקסימום: " +
-    "⚠️ המשימה הכי תקועה + 'מה חוסם?' | כמה משימות באיחור | אם הכל בסדר — רק '✅ במסלול'."
-  );
+  void (async () => {
+    await sendScheduled(
+      "צ'ק צהריים. הרץ get_tasks. פלט 3 שורות מקסימום: " +
+      "⚠️ המשימה הכי תקועה + 'מה חוסם?' | כמה משימות באיחור | אם הכל בסדר — רק '✅ במסלול'."
+    );
+    // Quick actions — make the nudge actionable, not just informative
+    if (registeredChatId) {
+      await bot.api.sendMessage(registeredChatId, "מה עושים עכשיו?", {
+        reply_markup: new InlineKeyboard()
+          .text("▶️ מה עכשיו", "qa:next").text("➕ יש משימות להוסיף", "qa:add").row()
+          .text("🗓️ תכנן את ההמשך", "plan:start"),
+      }).catch(() => {});
+    }
+  })();
 }, { timezone: "Asia/Jerusalem" });
 
 // 22:00 — evening review (6 lines max)
@@ -1793,6 +1865,51 @@ bot.callbackQuery("plan:start", async (ctx) => {
   await sendDayPlan(chatId).catch((e) => console.error("[plan:start]", e));
 });
 
+// ── Quick-action callbacks (midday nudge) ─────────────────────────────────────
+
+bot.callbackQuery("qa:next", async (ctx) => {
+  const chatId = ctx.chat?.id;
+  await ctx.answerCallbackQuery();
+  if (!chatId) return;
+  await sendNextUp(chatId).catch((e) => console.error("[qa:next]", e));
+});
+
+bot.callbackQuery("qa:add", async (ctx) => {
+  const chatId = ctx.chat?.id;
+  await ctx.answerCallbackQuery();
+  if (!chatId) return;
+  wizardStates.set(chatId, { type: "task", stage: "name" });
+  await bot.api.sendMessage(chatId, "מה שם המשימה?");
+});
+
+// ── Post-event follow-up callbacks ────────────────────────────────────────────
+
+bot.callbackQuery(/^evt:add:(.+)$/, async (ctx) => {
+  const c = postEventPending.get(ctx.match[1]);
+  postEventPending.delete(ctx.match[1]);
+  await ctx.answerCallbackQuery();
+  const chatId = ctx.chat?.id;
+  if (!c || !chatId) { await ctx.editMessageText("פג תוקף."); return; }
+  wizardStates.set(chatId, { type: "postevent", stage: "tasks", eventTitle: c.title });
+  await ctx.editMessageText(`📋 ${c.title} — מה המשימות שיצאו?\n(כתוב אותן, שורה לכל אחת, או הקלט)`);
+});
+
+bot.callbackQuery(/^evt:none:(.+)$/, async (ctx) => {
+  const c = postEventPending.get(ctx.match[1]);
+  postEventPending.delete(ctx.match[1]);
+  await ctx.answerCallbackQuery({ text: "✅" });
+  await ctx.editMessageText(`✅ ${c?.title ?? ""} — סגור.`);
+});
+
+bot.callbackQuery(/^evt:mute:(.+)$/, async (ctx) => {
+  const c = postEventPending.get(ctx.match[1]);
+  postEventPending.delete(ctx.match[1]);
+  await ctx.answerCallbackQuery({ text: "🔕 הושתק" });
+  if (!c) { await ctx.editMessageText("פג תוקף."); return; }
+  await upsertFact(`mute:${normalizeTitle(c.title)}`, "1", "_system").catch(() => {});
+  await ctx.editMessageText(`🔕 לא אשאל יותר על "${c.title}".`);
+});
+
 // ── "מה עכשיו" callbacks — rapid done→next chain ──────────────────────────────
 
 bot.callbackQuery(/^next:done:(\d+)$/, async (ctx) => {
@@ -2068,6 +2185,22 @@ async function handleWizard(chatId: number, text: string, state: WizardState): P
     }
   }
 
+  if (state.type === "postevent") {
+    wizardStates.delete(chatId);
+    lastAddedTask.delete(chatId);
+    try {
+      const reply = await runAgent(
+        chatId,
+        `יצאתי מ"${state.eventTitle}" עם המשימות הבאות. הוסף כל אחת עם add_task ונתב לתחום הנכון:\n${text}`
+      );
+      await safeSend(chatId, reply);
+      await maybeOfferScheduling(chatId);
+    } catch (err) {
+      await bot.api.sendMessage(chatId, `❌ שגיאה בהוספת המשימות: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return;
+  }
+
   if (state.type === "newlist") {
     wizardStates.delete(chatId);
     const name = text.trim();
@@ -2122,7 +2255,7 @@ bot.command("ctx", async (ctx) => {
 
 bot.command("memory", async (ctx) => {
   const active = await getActiveContext();
-  const facts = await loadUserFacts(active?.key ?? undefined);
+  const facts = (await loadUserFacts(active?.key ?? undefined)).filter((f) => f.context !== "_system");
   if (!facts.length) return ctx.reply("אין שום דבר שמור בזיכרון עדיין.");
 
   // Group by context
@@ -2461,6 +2594,9 @@ loadChatId().then(async () => {
     else fireReminder(r);
   }
   if (rescheduled > 0) console.log(`[reminders] Rescheduled ${rescheduled} pending reminder(s)`);
+
+  // Arm today's post-event follow-ups immediately (don't wait for the 15-min poll)
+  await pollEventFollowups().catch((err) => console.error("[event-followup:startup]", err));
 
   // Auth health check
   const authOk = await checkGoogleAuth();
