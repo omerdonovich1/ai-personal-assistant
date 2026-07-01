@@ -53,11 +53,14 @@ const scheduledTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
 
 // ── UI: Reply Keyboard ────────────────────────────────────────────────────────
 
+// Execution-first layout: top row drives DOING (next task / plan / timeline),
+// second row captures & views. Removed from keyboard (still work via text/commands):
+// אירוע+תזכורת (typing/voice is faster than the 2-step wizard), סקירה (/review),
+// נתונים (/stats — it's a weekly view, surfaced in weekly crons anyway).
 const MAIN_KEYBOARD = new Keyboard()
-  .text("➕ משימה").text("📋 משימות").text("📅 אירוע").row()
-  .text("⏰ תזכורת").text("🗓️ תכנן").text("🕐 סדר יום").row()
-  .text("📊 בריף").text("✅ סקירה").text("📧 מיילים").row()
-  .text("📈 נתונים")
+  .text("▶️ מה עכשיו").text("🗓️ תכנן").text("🕐 סדר יום").row()
+  .text("➕ משימה").text("📋 משימות").text("📊 בריף").row()
+  .text("📧 מיילים")
   .resized()
   .persistent();
 
@@ -483,6 +486,66 @@ async function sendTodayTimeline(chatId: number): Promise<void> {
   await bot.api.sendMessage(chatId, text, {
     reply_markup: new InlineKeyboard().text("🗓️ שבץ את הלא-משובצות", "plan:start"),
   });
+}
+
+// ── "מה עכשיו" — rapid execution loop ─────────────────────────────────────────
+// The pace engine: one tap surfaces THE next task (overdue first, then
+// Eisenhower priority, then nearest due date). ✅ completes it in Google Tasks
+// and the card morphs in-place into the next one — done→next→done→next.
+
+const nextQueues = new Map<number, { tasks: CachedTask[]; idx: number }>();
+
+function nextUpRank(t: { title: string; due: string | null }): [number, number, number] {
+  return [
+    isOverdue(t.due) ? 0 : 1,
+    PRIORITY_RANK[priorityOf(t.title)] ?? 4,
+    t.due ? new Date(t.due).getTime() : Number.MAX_SAFE_INTEGER,
+  ];
+}
+
+function nextUpCard(chatId: number): { text: string; kb: InlineKeyboard } | null {
+  const q = nextQueues.get(chatId);
+  if (!q || q.idx >= q.tasks.length) return null;
+  const t = q.tasks[q.idx];
+  const dueLine = t.due
+    ? isOverdue(t.due)
+      ? `🔺 באיחור (${new Date(t.due).toLocaleDateString("he-IL", { timeZone: "Asia/Jerusalem" })})`
+      : `📅 ${new Date(t.due).toLocaleDateString("he-IL", { timeZone: "Asia/Jerusalem" })}`
+    : "📅 ללא דדליין";
+  return {
+    text: `▶️ המשימה הבאה (${q.idx + 1}/${q.tasks.length}):\n\n${t.title}\n📂 ${t.listTitle} | ${dueLine}`,
+    kb: new InlineKeyboard()
+      .text("✅ סיימתי", `next:done:${q.idx}`).row()
+      .text("⏭️ הבא", `next:skip:${q.idx}`).text("🗓️ שבץ ביומן", `next:sched:${q.idx}`),
+  };
+}
+
+async function sendNextUp(chatId: number): Promise<void> {
+  const open = (await getTasks()).filter((t) => t.status === "needsAction");
+  if (open.length === 0) {
+    await bot.api.sendMessage(chatId, "🎉 אפס משימות פתוחות. כל הכבוד!", { reply_markup: MAIN_KEYBOARD });
+    return;
+  }
+  const sorted = [...open].sort((a, b) => {
+    const ra = nextUpRank(a), rb = nextUpRank(b);
+    return ra[0] - rb[0] || ra[1] - rb[1] || ra[2] - rb[2];
+  });
+  nextQueues.set(chatId, {
+    tasks: sorted.map((t) => ({ id: t.id, listId: t.listId, title: t.title, listTitle: t.listTitle, due: t.due })),
+    idx: 0,
+  });
+  const card = nextUpCard(chatId)!;
+  await bot.api.sendMessage(chatId, card.text, { reply_markup: card.kb });
+}
+
+/** Advance the queue and morph the SAME message into the next card (fast loop). */
+async function advanceNextUp(ctx: Context, chatId: number, prefix: string): Promise<void> {
+  const card = nextUpCard(chatId);
+  if (!card) {
+    await ctx.editMessageText(`${prefix}\n\n🏁 עברת על כל התור — אין עוד משימות.`);
+    return;
+  }
+  await ctx.editMessageText(`${prefix}\n\n${card.text}`, { reply_markup: card.kb });
 }
 
 // ── Tool definitions ──────────────────────────────────────────────────────────
@@ -1325,7 +1388,7 @@ bot.command("start", async (ctx) => {
   histories.delete(ctx.chat.id);
   wizardStates.delete(ctx.chat.id);
   return ctx.reply(
-    "מוכן לפעולה.\n\n*תחומים:* 🚴 SPINZ | 💍 תכשיטים | 💼 דינמיקה | 🚗 רכב דינמיקה | 🏡 בית | 🏠 סולשיין\n\n*חדש:* 🗓️ תכנן = שיבוץ אוטומטי ביומן | 🕐 סדר יום = כל היום לפי שעות | צ'ק-אין אוטומטי בסוף כל בלוק מתוזמן\n\n*לו\"ז אוטומטי:*\n🌅 07:00 בריף בוקר + הצעת תכנון\n🕐 12:30 צ'ק צהריים\n🌙 22:00 סיכום ערב\n📅 ראשון 08:00 תכנון שבוע\n📊 שישי 14:00 סקירת שבוע",
+    "מוכן לפעולה.\n\n*▶️ מה עכשיו* — המשימה הבאה בתור: בוצע → הבאה → בוצע. מצב ביצוע מהיר.\n*🗓️ תכנן* — שיבוץ המשימות החשובות ביומן | *🕐 סדר יום* — היום לפי שעות\n\nתזכורות ואירועים — פשוט תכתוב/תקליט (\"תזכיר לי מחר ב-9...\").\nפקודות: /next /plan /timeline /review /stats\n\n*לו\"ז אוטומטי:* 🌅 07:00 בריף | 🕐 12:30 צ'ק | 🌙 22:00 סיכום | 📅 ראשון תכנון | 📊 שישי סקירה",
     { parse_mode: "Markdown", reply_markup: MAIN_KEYBOARD }
   );
 });
@@ -1375,6 +1438,12 @@ bot.hears("🗓️ תכנן", async (ctx) => {
 bot.hears("🕐 סדר יום", async (ctx) => {
   await ctx.replyWithChatAction("typing");
   try { await sendTodayTimeline(ctx.chat.id); }
+  catch (err) { await ctx.reply(`שגיאה: ${err instanceof Error ? err.message : String(err)}`); }
+});
+
+bot.hears("▶️ מה עכשיו", async (ctx) => {
+  await ctx.replyWithChatAction("typing");
+  try { await sendNextUp(ctx.chat.id); }
   catch (err) { await ctx.reply(`שגיאה: ${err instanceof Error ? err.message : String(err)}`); }
 });
 
@@ -1724,6 +1793,51 @@ bot.callbackQuery("plan:start", async (ctx) => {
   await sendDayPlan(chatId).catch((e) => console.error("[plan:start]", e));
 });
 
+// ── "מה עכשיו" callbacks — rapid done→next chain ──────────────────────────────
+
+bot.callbackQuery(/^next:done:(\d+)$/, async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return ctx.answerCallbackQuery();
+  const q = nextQueues.get(chatId);
+  const idx = Number(ctx.match[1]);
+  if (!q || q.idx !== idx) { await ctx.answerCallbackQuery({ text: "לא עדכני — לחץ ▶️ מה עכשיו" }); return; }
+  const t = q.tasks[idx];
+  await ctx.answerCallbackQuery({ text: "✅ סגור!" });
+  try {
+    const done = await completeTask(t.id, t.listId);
+    await logCompletion(done.title, done.listTitle);
+    q.idx++;
+    await advanceNextUp(ctx, chatId, `✅ ${t.title}`);
+  } catch (err) {
+    await ctx.editMessageText(`❌ שגיאה בסגירת המשימה: ${err instanceof Error ? err.message : String(err)}`);
+  }
+});
+
+bot.callbackQuery(/^next:skip:(\d+)$/, async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return ctx.answerCallbackQuery();
+  const q = nextQueues.get(chatId);
+  const idx = Number(ctx.match[1]);
+  if (!q || q.idx !== idx) { await ctx.answerCallbackQuery({ text: "לא עדכני — לחץ ▶️ מה עכשיו" }); return; }
+  await ctx.answerCallbackQuery();
+  q.idx++;
+  await advanceNextUp(ctx, chatId, `⏭️ דילגת: ${q.tasks[idx].title.slice(0, 30)}`);
+});
+
+bot.callbackQuery(/^next:sched:(\d+)$/, async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return ctx.answerCallbackQuery();
+  const q = nextQueues.get(chatId);
+  const idx = Number(ctx.match[1]);
+  if (!q || q.idx !== idx) { await ctx.answerCallbackQuery({ text: "לא עדכני — לחץ ▶️ מה עכשיו" }); return; }
+  const t = q.tasks[idx];
+  await ctx.answerCallbackQuery({ text: "🗓️ מציע זמן..." });
+  q.idx++;
+  await advanceNextUp(ctx, chatId, `🗓️ משבץ: ${t.title.slice(0, 30)}`);
+  await offerScheduling(chatId, t.title, priorityOf(t.title), { id: t.id, listId: t.listId })
+    .catch((e) => console.error("[next:sched]", e));
+});
+
 // ── Progress check-in callbacks ────────────────────────────────────────────────
 
 bot.callbackQuery(/^chk:done:(.+)$/, async (ctx) => {
@@ -2047,6 +2161,25 @@ bot.command("timeline", async (ctx) => {
   await ctx.replyWithChatAction("typing");
   try { await sendTodayTimeline(ctx.chat.id); }
   catch (err) { await ctx.reply(`שגיאה: ${err instanceof Error ? err.message : String(err)}`); }
+});
+
+bot.command("next", async (ctx) => {
+  await ctx.replyWithChatAction("typing");
+  try { await sendNextUp(ctx.chat.id); }
+  catch (err) { await ctx.reply(`שגיאה: ${err instanceof Error ? err.message : String(err)}`); }
+});
+
+bot.command("stats", async (ctx) => {
+  await ctx.replyWithChatAction("typing");
+  const stopTyping = keepTyping(ctx);
+  try {
+    const reply = await runAgent(ctx.chat.id,
+      "הרץ get_productivity_stats. פלט 5 שורות מקסימום: " +
+      "📈 השבוע X מול Y שבוע שעבר (+Z%) | פירוק domain בשורה אחת | היום הכי חזק | תובנה אחת."
+    );
+    stopTyping();
+    await safeSend(ctx.chat.id, reply);
+  } catch (err) { stopTyping(); await ctx.reply(`שגיאה: ${err instanceof Error ? err.message : String(err)}`); }
 });
 
 bot.command("brief", async (ctx) => {
