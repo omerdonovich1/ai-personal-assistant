@@ -49,8 +49,10 @@ export async function ensureSchema(): Promise<void> {
       id          text PRIMARY KEY,
       chat_id     bigint NOT NULL,
       text        text NOT NULL,
-      fire_at     text NOT NULL
+      fire_at     text NOT NULL,
+      meta        jsonb
     );
+    ALTER TABLE reminders ADD COLUMN IF NOT EXISTS meta jsonb;
     CREATE TABLE IF NOT EXISTS facts (
       key         text NOT NULL,
       value       text NOT NULL,

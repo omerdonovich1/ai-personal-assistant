@@ -200,6 +200,22 @@ async function fireReminder(r: Reminder): Promise<void> {
   scheduledTimeouts.delete(r.id);
   await deleteReminder(r.id);
   try {
+    if (r.meta?.kind === "checkin") {
+      // Progress check-in on a scheduled work block
+      pendingCheckIns.set(r.id, {
+        chatId: r.chatId,
+        title: r.text,
+        taskRef: r.meta.taskId && r.meta.listId ? { id: r.meta.taskId, listId: r.meta.listId } : undefined,
+      });
+      await bot.api.sendMessage(r.chatId, `⏰ איך הולך עם:\n*${r.text}*`, {
+        parse_mode: "Markdown",
+        reply_markup: new InlineKeyboard()
+          .text("✅ סיימתי", `chk:done:${r.id}`).row()
+          .text("🔄 עוד קצת (30 ד')", `chk:more:${r.id}`).text("⏭️ דחיתי", `chk:skip:${r.id}`),
+      });
+      console.log(`[checkin:fired] ${r.id} — "${r.text}"`);
+      return;
+    }
     recentlyFired.set(r.id, { chatId: r.chatId, text: r.text });
     await bot.api.sendMessage(r.chatId, `⏰ תזכורת: ${r.text}`, {
       reply_markup: new InlineKeyboard()
@@ -333,32 +349,23 @@ async function offerScheduling(chatId: number, title: string, priorityEmoji: str
 // ── Progress check-ins ─────────────────────────────────────────────────────────
 // The "how's it going?" layer: when a scheduled block's end time arrives, ping
 // the user for a one-tap status instead of silently assuming it happened.
-// In-memory (same-day feature) — lost on redeploy, which is an acceptable
-// tradeoff since a missed check-in just means one skipped nudge, not lost data.
+// Persisted as reminders (meta.kind="checkin") — survives redeploys; the
+// normal startup reminder-rescheduling picks them up.
 
 interface PendingCheckIn { chatId: number; title: string; taskRef?: TaskRef }
 const pendingCheckIns = new Map<string, PendingCheckIn>();
-const checkInTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
 
-function scheduleCheckIn(chatId: number, title: string, endISO: string, taskRef?: TaskRef): void {
-  const delay = new Date(endISO).getTime() - Date.now();
-  if (delay <= 0 || delay > 2_147_483_647) return; // past or absurdly far — skip
-  const id = `chk_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-  pendingCheckIns.set(id, { chatId, title, taskRef });
-  const t = setTimeout(() => fireCheckIn(id).catch((e) => console.error("[checkin]", e)), delay);
-  checkInTimeouts.set(id, t);
-}
-
-async function fireCheckIn(id: string): Promise<void> {
-  checkInTimeouts.delete(id);
-  const c = pendingCheckIns.get(id);
-  if (!c) return;
-  await bot.api.sendMessage(c.chatId, `⏰ איך הולך עם:\n*${c.title}*`, {
-    parse_mode: "Markdown",
-    reply_markup: new InlineKeyboard()
-      .text("✅ סיימתי", `chk:done:${id}`).row()
-      .text("🔄 עוד קצת (30 ד')", `chk:more:${id}`).text("⏭️ דחיתי", `chk:skip:${id}`),
-  });
+async function scheduleCheckIn(chatId: number, title: string, endISO: string, taskRef?: TaskRef): Promise<void> {
+  if (new Date(endISO).getTime() <= Date.now()) return; // block already ended
+  const r: Reminder = {
+    id: `chk_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    chatId,
+    text: title,
+    fireAt: new Date(endISO).toISOString(),
+    meta: { kind: "checkin", taskId: taskRef?.id, listId: taskRef?.listId },
+  };
+  await upsertReminder(r);
+  scheduleReminder(r);
 }
 
 // ── Plan-my-day ritual ────────────────────────────────────────────────────────
@@ -875,6 +882,138 @@ function keepTyping(ctx: { replyWithChatAction: (a: "typing") => Promise<unknown
 
 // ── Agentic loop ──────────────────────────────────────────────────────────────
 
+// Static instruction core — identical on every call so it (plus the tool
+// definitions) is served from Anthropic's prompt cache: rounds 2+ of every
+// agentic loop and back-to-back messages pay ~10% for this prefix.
+const STATIC_SYSTEM = `You are an elite Executive AI Assistant and thinking partner. Reply ONLY in Hebrew. Sharp, direct, zero fluff.
+Default location: בית חרות, ישראל.
+
+## חוקי תאריך/שעה — אל תסטה:
+- אסור לחשב תאריכים בעצמך. כל תאריך חייב להילקח מלוח התאריכים (בהמשך) בלבד.
+- כל מחרוזת ISO חייבת להסתיים ב-offset שכתוב בלוח (קיץ +03:00, חורף +02:00).
+- "מחר"/"מחרתיים"/יום בשבוע → קח את ה-YYYY-MM-DD המדויק מהלוח.
+- שעות: בבוקר=08:00 | בצהריים=12:00 | אחה"צ=15:00 | בערב=18:00 | בלילה=21:00 | ללא שעה→09:00.
+- אם המשתמש נתן שעה מפורשת — השתמש בה כפי שהיא, אל תשנה.
+
+## דיוק ואמינות (קריטי):
+- כתוב עברית תקנית בלבד. אסור להמציא מילים, שמות, או עובדות.
+- אם אינך בטוח בפרט — שאל, אל תמציא.
+- אל תאשר פעולה שלא בוצעה בפועל דרך כלי.
+
+## CORE PHILOSOPHY — chief of staff, NOT a passive secretary.
+- Don't just log what you're told — PLACE it, PREPARE it, CHASE it. Be proactive.
+- After capturing a task, the system already offers to schedule it (calendar buttons) — NEVER ask "מתי הדדליין" / "כמה זמן לוקח", the buttons handle timing.
+- Anticipate the next step and surface it. Protect the user's time. Close open loops.
+- ONE sharp clarifying question only when genuinely ambiguous ("איזה צוות?" with options). Never an interrogation, never a silent wrong guess. If you can infer, infer.
+
+## TELEGRAM FORMAT — HARD RULES (messages render as plain text on a phone):
+- NEVER use markdown tables, NEVER use --- separators, NEVER use ## headers.
+- Short lines. One idea per line. One emoji at line start as a visual anchor.
+- *bold* only for the 2-3 most critical words in the whole message.
+- Briefs: 12 lines MAX. Other replies: 6 lines MAX unless the user asked for detail.
+- Cut everything that doesn't change what the user does in the next hour. No "סיכום", no repetition of what they already know.
+
+## IRON RULES:
+1. NEVER confirm any action without calling the tool first.
+2. No narration — do it, then report the result + insight.
+3. Auto-route domains silently, never ask for clarification.
+
+## DOMAIN ROUTING:
+- 🚴 SPINZ: אופניים, שלדה, single-speed, ספקי סין/Guangzhou → list "Spinz"
+- 💍 תכשיטים/Onde: Shopify, jewelry, dropshipping, e-commerce → list "תכשיטים"
+- 💼 דינמיקה/Tech: software, Carman S, Next.js, TypeScript, MCP, QC, fleet mgmt → list "דינמיקה"
+- 🚗 רכב דינמיקה: רכבי החברה, טסט/רישוי/ביטוח רכב, מוסך, פסקלים, מלגזות → list "רכב דינמיקה"
+- 🏡 חיי בית: Jack Russell, Kia Picanto, Ninja Grill, cooking, fitness, personal → list "חיי בית"
+- 🏠 סולשיין: עומר/וירין/Sunshine → list "סולשיין"
+- No keyword → infer the best-fit domain from meaning; the fallback list is given in the dynamic context below.
+- ONLY these 6 lists exist. NEVER pass any other listName — auto-creating lists is disabled.
+
+## TASKS — ENGAGE, don't just log:
+- Call add_task IMMEDIATELY (no prior confirmation).
+- PRIORITY MATRIX: classify every new task silently (Eisenhower): דחוף+חשוב=🔴 | חשוב=🟡 | דחוף=🟠 | אחר=⚪. Prefix the task title with the emoji (e.g. "🔴 לשלם לספק").
+- After adding, reply only: ✅ נוסף: "<title>" — the system will offer calendar placement buttons automatically.
+
+## FOLLOW-UP CHAINS — after complete_task:
+- Think: what's the natural NEXT step after this task? Suggest it: "סיימת X — השלב הבא הוא Y, להוסיף כמשימה?"
+- Example: בדק ספק → הצעת מחיר. שלח הצעה → תזכורת מעקב. קנה חלק → התקנה.
+
+## TASK ANALYSIS — whenever you see the task list:
+- Sort by priority emoji: 🔴 first, then 🟡, 🟠, ⚪.
+- Flag tasks with no due date: "חסר דדליין — מתי?"
+- Flag stale tasks: 'updated' older than 3 days from היום שבלוח התאריכים → "פתוחה X ימים — מה חוסם?"
+- If >4 tasks in one domain: "יש לך X משימות ב-[domain] — לסדר עדיפויות?"
+- Always end with: "מה הדבר הכי חשוב להשלים היום?"
+
+## CALENDAR HEALTH — check whenever you see today's events:
+- Back-to-back meetings with no buffer → "⚠️ אין הפסקה בין X ל-Y"
+- No lunch window 12:00-14:00 → "⚠️ אין חלון לארוחת צהריים"
+- Meeting after 20:00 → flag it.
+
+## MORNING BRIEF — full task dump grouped by domain, then context:
+מבנה (ללא טבלאות, ללא ---):
+☀️ <temp>° <desc one word>
+
+📋 כל המשימות הפתוחות (לפי תחום, ממוין 🔴 קודם):
+💼 דינמיקה (N): <task> · <task>
+🚗 רכב דינמיקה (N): <task>
+🚴 SPINZ (N): <task> · <task>
+💍 תכשיטים (N): ...
+🏡 בית (N): ...
+(דלג על תחום ריק)
+
+⚠️ <התרעה אחת חשובה: כמה באיחור / קונפליקט ביומן / מייל דחוף>
+🕐 <חלון פנוי> → <משימה מוצעת>
+
+חוקים: כל משימה בשורה אחת, מקוצרת. תחום ריק — דלג. בלי שאלת סיום.
+
+## REMINDERS — CALL set_reminder IMMEDIATELY:
+- fireAt תמיד מהלוח: "מחר 9" → התאריך של מחר + T09:00:00 + offset מהלוח. "בעוד שעה" → שעה נוכחית +1.
+- Reply: ✅ תזכורת: "<text>" ב-<time>
+
+## CALENDAR:
+- add_calendar_event (Hebrew) / quick_add (English only)
+- startDateTime/endDateTime — תאריך מהלוח + שעה + offset מהלוח. No end→+1h.
+- כל שבוע → RRULE:FREQ=WEEKLY;BYDAY=XX (XX=SU/MO/TU/WE/TH/FR/SA)
+- After adding: ✅ ביומן: "<title>" — check for conflicts with existing events.
+
+## EMAIL:
+- Draft first, show, ask "לשלוח? ✅/❌". send_email ONLY after explicit yes.
+- 48h follow-up reminder auto-set by system.
+
+## MEMORY — extract entities automatically:
+- Names, phones, prices, contacts → remember_fact silently with context.
+- Use stored facts to personalize every response (no "אמרת לי ש..." — just USE the info).
+
+## COMPLEX INPUT — chain of actions:
+Extract ALL entities → run tools in parallel → single synthesized response.
+
+## SEARCH/WEATHER/RATES — use proactively when context suggests it.
+## IMAGES — extract entities (dates/amounts/tasks) → execute → report.
+## SCHEDULING — find_free_slots → proactively suggest time-blocking for open tasks.`;
+
+// Anthropic API call with exponential-backoff retry on transient failures
+// (429 rate-limit, 529 overloaded, 5xx). Prevents one flaky moment from
+// surfacing as a user-visible error.
+async function createMessageWithRetry(
+  params: Anthropic.MessageCreateParamsNonStreaming
+): Promise<Anthropic.Message> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= 2; attempt++) {
+    try {
+      return await anthropic.messages.create(params);
+    } catch (err) {
+      lastErr = err;
+      const status = (err as { status?: number }).status;
+      const retryable = status === 429 || status === 529 || (typeof status === "number" && status >= 500);
+      if (!retryable || attempt === 2) throw err;
+      const waitMs = 1000 * 2 ** attempt + Math.floor(Math.random() * 300);
+      console.warn(`[api:retry] status=${status}, attempt ${attempt + 1}, waiting ${waitMs}ms`);
+      await new Promise((r) => setTimeout(r, waitMs));
+    }
+  }
+  throw lastErr;
+}
+
 async function runAgent(
   chatId: number,
   userText: string,
@@ -927,115 +1066,15 @@ async function runAgent(
 - שמור מידע חדש שהמשתמש מספר עם context="${activeCtx.key}" (אנשי קשר, פרטים, תהליכים ספציפיים ל-${activeCtx.name}).`
     : "";
 
-  const SYSTEM = `You are an elite Executive AI Assistant and thinking partner. Reply ONLY in Hebrew. Sharp, direct, zero fluff.
-Now: ${israelTimeStr}. Default location: בית חרות, ישראל.${contextSection}${factsSection}${memorySection}
+  // Small per-message dynamic block — the static core + tools live in the
+  // prompt cache; only this part changes between calls.
+  const DYNAMIC_SYSTEM = `## הקשר עדכני:
+Now: ${israelTimeStr}
 
 ## DATE REFERENCE — לוח התאריכים (קריטי, ציית בדיוק):
 ${dateRef}
-חוקי תאריך/שעה — אל תסטה:
-- אסור לחשב תאריכים בעצמך. כל תאריך חייב להילקח מהטבלה למעלה בלבד.
-- כל מחרוזת ISO חייבת להסתיים ב-"${offsetStr}" (לא תמיד +03:00 — השתמש במה שכתוב כאן).
-- "מחר"/"מחרתיים"/יום בשבוע → קח את ה-YYYY-MM-DD המדויק מהטבלה.
-- שעות: בבוקר=08:00 | בצהריים=12:00 | אחה"צ=15:00 | בערב=18:00 | בלילה=21:00 | ללא שעה→09:00.
-- אם המשתמש נתן שעה מפורשת — השתמש בה כפי שהיא, אל תשנה.
-
-## דיוק ואמינות (קריטי):
-- כתוב עברית תקנית בלבד. אסור להמציא מילים, שמות, או עובדות.
-- אם אינך בטוח בפרט — שאל, אל תמציא.
-- אל תאשר פעולה שלא בוצעה בפועל דרך כלי.
-
-## CORE PHILOSOPHY — chief of staff, NOT a passive secretary.
-- Don't just log what you're told — PLACE it, PREPARE it, CHASE it. Be proactive.
-- After capturing a task, the system already offers to schedule it (calendar buttons) — don't ask "מתי הדדליין", let the buttons handle timing.
-- Anticipate the next step and surface it. Protect the user's time. Close open loops.
-- ONE sharp clarifying question only when genuinely ambiguous ("איזה צוות?" with options). Never an interrogation, never a silent wrong guess. If you can infer, infer.
-
-## TELEGRAM FORMAT — HARD RULES (messages render as plain text on a phone):
-- NEVER use markdown tables, NEVER use --- separators, NEVER use ## headers.
-- Short lines. One idea per line. One emoji at line start as a visual anchor.
-- *bold* only for the 2-3 most critical words in the whole message.
-- Briefs: 12 lines MAX. Other replies: 6 lines MAX unless the user asked for detail.
-- Cut everything that doesn't change what the user does in the next hour. No "סיכום", no repetition of what they already know.
-
-## IRON RULES:
-1. NEVER confirm any action without calling the tool first.
-2. No narration — do it, then report the result + insight.
-3. Auto-route domains silently, never ask for clarification.
-
-## DOMAIN ROUTING:
-- 🚴 SPINZ: אופניים, שלדה, single-speed, ספקי סין/Guangzhou → list "Spinz"
-- 💍 תכשיטים/Onde: Shopify, jewelry, dropshipping, e-commerce → list "תכשיטים"
-- 💼 דינמיקה/Tech: software, Carman S, Next.js, TypeScript, MCP, QC, fleet mgmt → list "דינמיקה"
-- 🚗 רכב דינמיקה: רכבי החברה, טסט/רישוי/ביטוח רכב, מוסך, פסקלים, מלגזות → list "רכב דינמיקה"
-- 🏡 חיי בית: Jack Russell, Kia Picanto, Ninja Grill, cooking, fitness, personal → list "חיי בית"
-- 🏠 סולשיין: עומר/וירין/Sunshine → list "סולשיין"
-- No keyword → infer the best-fit domain from meaning; truly unclear → "${activeCtx?.taskList ?? "חיי בית"}"
-- ONLY these 6 lists exist. NEVER pass any other listName — auto-creating lists is disabled.
-
-## TASKS — ENGAGE, don't just log:
-- Call add_task IMMEDIATELY (no prior confirmation).
-- PRIORITY MATRIX: classify every new task silently (Eisenhower): דחוף+חשוב=🔴 | חשוב=🟡 | דחוף=🟠 | אחר=⚪. Prefix the task title with the emoji (e.g. "🔴 לשלם לספק").
-- Time defaults: בבוקר=08:00 | בצהריים=12:00 | אחה"צ=15:00 | בערב=18:00 | no time→09:00
-- After adding: ✅ נוסף: "<title>" — then ask ONE of: "מה הדדליין?" / "כמה זמן לוקח?" / "מה יכול לחסום?" (pick the most relevant)
-- If no due date given: always ask "מתי צריך לסיים את זה?"
-
-## FOLLOW-UP CHAINS — after complete_task:
-- Think: what's the natural NEXT step after this task? Suggest it: "סיימת X — השלב הבא הוא Y, להוסיף כמשימה?"
-- Example: בדק ספק → הצעת מחיר. שלח הצעה → תזכורת מעקב. קנה חלק → התקנה.
-
-## TASK ANALYSIS — whenever you see the task list:
-- Sort by priority emoji: 🔴 first, then 🟡, 🟠, ⚪.
-- Flag tasks with no due date: "חסר דדליין — מתי?"
-- Flag stale tasks: 'updated' older than 3 days from today (${israelDateStr}) → "פתוחה X ימים — מה חוסם?"
-- If >4 tasks in one domain: "יש לך X משימות ב-[domain] — לסדר עדיפויות?"
-- Always end with: "מה הדבר הכי חשוב להשלים היום?"
-
-## CALENDAR HEALTH — check whenever you see today's events:
-- Back-to-back meetings with no buffer → "⚠️ אין הפסקה בין X ל-Y"
-- No lunch window 12:00-14:00 → "⚠️ אין חלון לארוחת צהריים"
-- Meeting after 20:00 → flag it.
-
-## MORNING BRIEF — full task dump grouped by domain, then context:
-מבנה (ללא טבלאות, ללא ---):
-☀️ <temp>° <desc one word>
-
-📋 כל המשימות הפתוחות (לפי תחום, ממוין 🔴 קודם):
-💼 דינמיקה (N): <task> · <task>
-🚗 רכב דינמיקה (N): <task>
-🚴 SPINZ (N): <task> · <task>
-💍 תכשיטים (N): ...
-🏡 בית (N): ...
-(דלג על תחום ריק)
-
-⚠️ <התרעה אחת חשובה: כמה באיחור / קונפליקט ביומן / מייל דחוף>
-🕐 <חלון פנוי> → <משימה מוצעת>
-
-חוקים: כל משימה בשורה אחת, מקוצרת. תחום ריק — דלג. בלי שאלת סיום.
-
-## REMINDERS — CALL set_reminder IMMEDIATELY:
-- fireAt תמיד מהטבלה: "מחר 9" → התאריך של מחר + T09:00:00${offsetStr}. "בעוד שעה" → שעה נוכחית +1.
-- Reply: ✅ תזכורת: "<text>" ב-<time>
-
-## CALENDAR:
-- add_calendar_event (Hebrew) / quick_add (English only)
-- startDateTime/endDateTime — תאריך מהטבלה + שעה, סיומת ${offsetStr}. No end→+1h.
-- כל שבוע → RRULE:FREQ=WEEKLY;BYDAY=XX (XX=SU/MO/TU/WE/TH/FR/SA)
-- After adding: ✅ ביומן: "<title>" — check for conflicts with existing events.
-
-## EMAIL:
-- Draft first, show, ask "לשלוח? ✅/❌". send_email ONLY after explicit yes.
-- 48h follow-up reminder auto-set by system.
-
-## MEMORY — extract entities automatically:
-- Names, phones, prices, contacts → remember_fact silently with context.
-- Use stored facts to personalize every response (no "אמרת לי ש..." — just USE the info).
-
-## COMPLEX INPUT — chain of actions:
-Extract ALL entities → run tools in parallel → single synthesized response.
-
-## SEARCH/WEATHER/RATES — use proactively when context suggests it.
-## IMAGES — extract entities (dates/amounts/tasks) → execute → report.
-## SCHEDULING — find_free_slots → proactively suggest time-blocking for open tasks.`;
+- offset נוכחי למחרוזות ISO: "${offsetStr}"
+- רשימת ברירת מחדל כשאין רמז לתחום: "${activeCtx?.taskList ?? "חיי בית"}"${contextSection}${factsSection}${memorySection}`;
 
   // Build the user message content
   const userContent: Anthropic.ContentBlockParam[] = extraContent
@@ -1045,19 +1084,35 @@ Extract ALL entities → run tools in parallel → single synthesized response.
   history.push({ role: "user", content: userContent });
   const messages = [...history];
 
-  while (true) {
-    const response = await anthropic.messages.create({
+  // Prompt caching: mark the static prefix (tools + static system) as cacheable.
+  const allTools = [...TOOLS, ...getMcpTools()];
+  const cachedTools: Anthropic.ToolUnion[] = allTools.map((t, i) =>
+    i === allTools.length - 1 ? { ...t, cache_control: { type: "ephemeral" as const } } : t
+  );
+  const systemBlocks: Anthropic.TextBlockParam[] = [
+    { type: "text", text: STATIC_SYSTEM, cache_control: { type: "ephemeral" } },
+    { type: "text", text: DYNAMIC_SYSTEM },
+  ];
+
+  // Hard cap on agentic rounds — a runaway tool loop must never burn tokens forever.
+  const MAX_ROUNDS = 12;
+  for (let round = 0; round < MAX_ROUNDS; round++) {
+    const response = await createMessageWithRetry({
       model,
       max_tokens: maxTokens,
       // Low temperature: deterministic categorization and exact dates, far less
       // hallucination / invented Hebrew. Analysis tier gets a little room.
       temperature: tier === "fast" ? 0 : 0.3,
-      system: SYSTEM,
-      tools: [...TOOLS, ...getMcpTools()],
+      system: systemBlocks,
+      tools: cachedTools,
       messages,
     });
 
     messages.push({ role: "assistant", content: response.content });
+
+    if (response.stop_reason === "max_tokens") {
+      console.warn(`[agent] hit max_tokens (tier=${tier}) — response truncated`);
+    }
 
     if (response.stop_reason === "tool_use") {
       const toolBlocks = response.content.filter(
@@ -1086,6 +1141,8 @@ Extract ALL entities → run tools in parallel → single synthesized response.
       return reply;
     }
   }
+  console.error(`[agent] aborted after ${MAX_ROUNDS} tool rounds (chatId=${chatId})`);
+  return "⚠️ הפעולה מורכבת מדי — עצרתי באמצע. פרק אותה לבקשות קטנות יותר.";
 }
 
 // ── Chat ID persistence ────────────────────────────────────────────────────────
@@ -1120,13 +1177,32 @@ async function checkGoogleAuth(): Promise<boolean> {
 
 // ── Scheduled messages ────────────────────────────────────────────────────────
 
+// Telegram hard limit is 4096 chars — long briefs must be chunked or the send
+// fails entirely and the user gets nothing.
+const TG_CHUNK = 4000;
+function chunkText(text: string): string[] {
+  if (text.length <= TG_CHUNK) return [text];
+  const chunks: string[] = [];
+  let rest = text;
+  while (rest.length > TG_CHUNK) {
+    let cut = rest.lastIndexOf("\n", TG_CHUNK);
+    if (cut < TG_CHUNK / 2) cut = TG_CHUNK; // no good break point — hard cut
+    chunks.push(rest.slice(0, cut));
+    rest = rest.slice(cut);
+  }
+  if (rest.trim()) chunks.push(rest);
+  return chunks;
+}
+
 async function safeSend(chatId: number, text: string): Promise<void> {
   const safe = text?.trim();
   if (!safe) return;
-  try {
-    await bot.api.sendMessage(chatId, safe, { parse_mode: "Markdown" });
-  } catch {
-    await bot.api.sendMessage(chatId, safe);
+  for (const chunk of chunkText(safe)) {
+    try {
+      await bot.api.sendMessage(chatId, chunk, { parse_mode: "Markdown" });
+    } catch {
+      await bot.api.sendMessage(chatId, chunk);
+    }
   }
 }
 
@@ -1568,7 +1644,7 @@ bot.callbackQuery(/^ldelyes:(\d+)$/, async (ctx) => {
 async function placeOnCalendar(ctx: Context, title: string, startISO: string, endISO: string, taskRef?: TaskRef): Promise<void> {
   await addCalendarEvent(title, startISO, endISO);
   const chatId = ctx.chat?.id;
-  if (chatId) scheduleCheckIn(chatId, title, endISO, taskRef);
+  if (chatId) await scheduleCheckIn(chatId, title, endISO, taskRef).catch((e) => console.error("[checkin:schedule]", e));
   await ctx.editMessageText(`✅ ביומן: ${title}\n🗓️ ${heDay(startISO)} ${hhmm(startISO)}–${hhmm(endISO)}`);
 }
 
@@ -1626,7 +1702,7 @@ bot.callbackQuery(/^plan:ok:(.+)$/, async (ctx) => {
   for (const b of plan.blocks) {
     try {
       await addCalendarEvent(b.title, b.startISO, b.endISO);
-      scheduleCheckIn(plan.chatId, b.title, b.endISO, b.taskRef);
+      await scheduleCheckIn(plan.chatId, b.title, b.endISO, b.taskRef);
       ok++;
     } catch (err) { console.error("[plan] event failed:", err instanceof Error ? err.message : err); }
   }
@@ -1674,7 +1750,7 @@ bot.callbackQuery(/^chk:more:(.+)$/, async (ctx) => {
   await ctx.answerCallbackQuery({ text: "⏰ עוד 30 דקות" });
   if (!c) { await ctx.editMessageText("פג תוקף."); return; }
   const nextEnd = toIsraelISO(new Date(Date.now() + 30 * 60000));
-  scheduleCheckIn(c.chatId, c.title, nextEnd, c.taskRef);
+  await scheduleCheckIn(c.chatId, c.title, nextEnd, c.taskRef).catch((e) => console.error("[chk:more]", e));
   await ctx.editMessageText(`🔄 בסדר, אבדוק שוב עוד 30 דקות: ${c.title}`);
 });
 
@@ -1789,17 +1865,27 @@ bot.callbackQuery(/^email:(send|cancel|edit):(.+)$/, async (ctx) => {
 
 // ── Wizard: handle text input during active wizard ─────────────────────────────
 
+/** One-shot Hebrew-date → ISO conversion. Direct API call — must NOT go through
+ *  runAgent, which would pollute the chat history with conversion turns. */
+async function convertDateOneShot(dueText: string): Promise<string | undefined> {
+  try {
+    const res = await createMessageWithRetry({
+      model: "claude-haiku-4-5",
+      max_tokens: 100,
+      temperature: 0,
+      system: `המר ביטוי זמן בעברית למחרוזת ISO 8601 אחת.\n${dateReference()}\nהחזר אך ורק את המחרוזת (לדוגמה 2026-06-21T09:00:00+03:00), בלי שום טקסט נוסף. ללא שעה → 09:00.`,
+      messages: [{ role: "user", content: dueText }],
+    });
+    const txt = res.content.filter((b): b is Anthropic.TextBlock => b.type === "text").map((b) => b.text).join("");
+    return txt.match(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}/)?.[0];
+  } catch {
+    return undefined;
+  }
+}
+
 async function doAddTask(chatId: number, name: string, listName: string, dueText: string | undefined): Promise<void> {
   try {
-    let dueIso: string | undefined;
-    if (dueText) {
-      const result = await runAgent(
-        chatId,
-        `המר את "${dueText}" למחרוזת ISO 8601 לפי לוח התאריכים. אל תקרא לאף כלי. החזר אך ורק את המחרוזת (לדוגמה 2026-06-21T09:00:00+03:00), ללא טקסט נוסף.`
-      );
-      const match = result.match(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}/);
-      dueIso = match ? match[0] : undefined;
-    }
+    const dueIso = dueText ? await convertDateOneShot(dueText) : undefined;
     const task = await addTask(name, listName, dueIso);
     const dueStr = dueIso ? ` | 📅 ${new Date(dueIso).toLocaleDateString("he-IL", { timeZone: "Asia/Jerusalem" })}` : "";
     const domLabel = DOMAIN_OPTIONS.find(d => d.list === listName)?.label ?? listName;
@@ -1945,7 +2031,9 @@ bot.command("reminders", async (ctx) => {
   const all = await loadReminders();
   const mine = all.filter((r) => r.chatId === ctx.chat.id);
   if (!mine.length) return ctx.reply("אין תזכורות ממתינות.");
-  const lines = mine.map((r) => `• ${r.text} — ${new Date(r.fireAt).toLocaleString("he-IL", { timeZone: "Asia/Jerusalem" })}`);
+  const lines = mine.map((r) =>
+    `• ${r.meta?.kind === "checkin" ? "⏱ צ'ק-אין: " : ""}${r.text} — ${new Date(r.fireAt).toLocaleString("he-IL", { timeZone: "Asia/Jerusalem" })}`
+  );
   return ctx.reply(`⏰ תזכורות ממתינות:\n\n${lines.join("\n")}`);
 });
 
@@ -2167,6 +2255,41 @@ bot.on("message:text", async (ctx) => {
     await ctx.reply(`שגיאה: ${msg}`);
   }
 });
+
+// ── Global error handler ──────────────────────────────────────────────────────
+// Without bot.catch, an unhandled error in any handler kills the long-polling
+// loop and the bot goes silent until the container restarts.
+
+let lastErrorNotifyAt = 0;
+bot.catch(async (err) => {
+  console.error("[bot:error]", err.error instanceof Error ? err.error.stack : err.error);
+  const chatId = err.ctx?.chat?.id;
+  // Notify the user, but at most once per minute — never spam on an error storm.
+  if (chatId && Date.now() - lastErrorNotifyAt > 60_000) {
+    lastErrorNotifyAt = Date.now();
+    await bot.api.sendMessage(chatId, "⚠️ משהו השתבש בפעולה האחרונה. נסה שוב.").catch(() => {});
+  }
+});
+
+// ── Stale-state sweep ─────────────────────────────────────────────────────────
+// Pending-button state (slot offers, day plans, fired reminders) is in-memory
+// and keyed by tokens that embed their creation timestamp — sweep anything the
+// user never tapped so the maps can't grow unboundedly.
+
+function sweepStale(map: Map<string, unknown>, maxAgeMs: number): void {
+  const now = Date.now();
+  for (const key of map.keys()) {
+    const ts = Number(key.split("_")[1]);
+    if (!Number.isNaN(ts) && now - ts > maxAgeMs) map.delete(key);
+  }
+}
+setInterval(() => {
+  const DAY = 24 * 60 * 60 * 1000;
+  sweepStale(pendingSlots, DAY);
+  sweepStale(dayPlans, DAY);
+  sweepStale(recentlyFired, DAY);
+  sweepStale(pendingCheckIns, DAY);
+}, 60 * 60 * 1000);
 
 // ── Graceful shutdown ─────────────────────────────────────────────────────────
 

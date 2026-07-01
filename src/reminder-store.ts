@@ -9,11 +9,19 @@ const __dirname = dirname(__filename);
 const DATA_DIR = join(__dirname, "..", "data");
 const FILE = join(DATA_DIR, "reminders.json");
 
+/** Optional payload that changes how a reminder fires (e.g. progress check-ins). */
+export interface ReminderMeta {
+  kind: "checkin";
+  taskId?: string;
+  listId?: string;
+}
+
 export interface Reminder {
   id: string;
   chatId: number;
   text: string;
   fireAt: string; // ISO 8601
+  meta?: ReminderMeta | null;
 }
 
 async function loadJson(): Promise<Reminder[]> {
@@ -32,8 +40,11 @@ async function saveJson(reminders: Reminder[]): Promise<void> {
 export async function loadReminders(): Promise<Reminder[]> {
   if (db) {
     await ensureSchema();
-    const r = await db.query("SELECT id, chat_id, text, fire_at FROM reminders ORDER BY fire_at");
-    return r.rows.map((x) => ({ id: x.id, chatId: Number(x.chat_id), text: x.text, fireAt: x.fire_at }));
+    const r = await db.query("SELECT id, chat_id, text, fire_at, meta FROM reminders ORDER BY fire_at");
+    return r.rows.map((x) => ({
+      id: x.id, chatId: Number(x.chat_id), text: x.text, fireAt: x.fire_at,
+      meta: (x.meta as ReminderMeta | null) ?? null,
+    }));
   }
   return loadJson();
 }
@@ -42,9 +53,9 @@ export async function upsertReminder(r: Reminder): Promise<void> {
   if (db) {
     await ensureSchema();
     await db.query(
-      `INSERT INTO reminders (id, chat_id, text, fire_at) VALUES ($1, $2, $3, $4)
-       ON CONFLICT (id) DO UPDATE SET chat_id = $2, text = $3, fire_at = $4`,
-      [r.id, r.chatId, r.text, r.fireAt]
+      `INSERT INTO reminders (id, chat_id, text, fire_at, meta) VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (id) DO UPDATE SET chat_id = $2, text = $3, fire_at = $4, meta = $5`,
+      [r.id, r.chatId, r.text, r.fireAt, r.meta ? JSON.stringify(r.meta) : null]
     );
     return;
   }
