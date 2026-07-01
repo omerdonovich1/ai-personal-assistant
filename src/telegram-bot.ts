@@ -95,10 +95,6 @@ type WizardState =
   | { type: "task";     stage: "name" }
   | { type: "task";     stage: "domain"; name: string }
   | { type: "task";     stage: "due";    name: string; listName: string }
-  | { type: "event";    stage: "title" }
-  | { type: "event";    stage: "datetime"; title: string }
-  | { type: "reminder"; stage: "text" }
-  | { type: "reminder"; stage: "time";  text: string }
   | { type: "newlist";  stage: "name" }
   | { type: "postevent"; stage: "tasks"; eventTitle: string };
 
@@ -1478,16 +1474,6 @@ bot.hears("➕ משימה", async (ctx) => {
   await ctx.reply("מה שם המשימה?");
 });
 
-bot.hears("📅 אירוע", async (ctx) => {
-  wizardStates.set(ctx.chat.id, { type: "event", stage: "title" });
-  await ctx.reply("מה שם האירוע?");
-});
-
-bot.hears("⏰ תזכורת", async (ctx) => {
-  wizardStates.set(ctx.chat.id, { type: "reminder", stage: "text" });
-  await ctx.reply("מה התזכורת?");
-});
-
 bot.hears("📊 בריף", async (ctx) => {
   await ctx.replyWithChatAction("typing");
   const stopTyping = keepTyping(ctx);
@@ -1519,39 +1505,11 @@ bot.hears("▶️ מה עכשיו", async (ctx) => {
   catch (err) { await ctx.reply(`שגיאה: ${err instanceof Error ? err.message : String(err)}`); }
 });
 
-bot.hears("✅ סקירה", async (ctx) => {
-  await ctx.replyWithChatAction("typing");
-  const stopTyping = keepTyping(ctx);
-  try {
-    const reply = await runAgent(ctx.chat.id,
-      "סקירת משימות. הרץ get_tasks על כל הרשימות. פלט 8 שורות מקסימום: " +
-      "📋 פתוחות לפי domain — שורה אחת (למשל: דינמיקה 8 | SPINZ 5) | " +
-      "⚠️ 2 הכי תקועות + 'מה חוסם?' (2 שורות) | 📌 חסרות דדליין — מספר בלבד + הצעה לטפל | " +
-      "👉 פעולה אחת מומלצת עכשיו."
-    );
-    stopTyping();
-    await safeSend(ctx.chat.id, reply);
-  } catch (err) { stopTyping(); await ctx.reply(`שגיאה: ${err instanceof Error ? err.message : String(err)}`); }
-});
-
 bot.hears("📧 מיילים", async (ctx) => {
   await ctx.replyWithChatAction("typing");
   const stopTyping = keepTyping(ctx);
   try {
     const reply = await runAgent(ctx.chat.id, "הראה לי את המיילים האחרונים הלא-נקראים. סכם כל אחד בשורה אחת.");
-    stopTyping();
-    await safeSend(ctx.chat.id, reply);
-  } catch (err) { stopTyping(); await ctx.reply(`שגיאה: ${err instanceof Error ? err.message : String(err)}`); }
-});
-
-bot.hears("📈 נתונים", async (ctx) => {
-  await ctx.replyWithChatAction("typing");
-  const stopTyping = keepTyping(ctx);
-  try {
-    const reply = await runAgent(ctx.chat.id,
-      "הרץ get_productivity_stats. פלט 5 שורות מקסימום: " +
-      "📈 השבוע X מול Y שבוע שעבר (+Z%) | פירוק domain בשורה אחת | היום הכי חזק | תובנה אחת."
-    );
     stopTyping();
     await safeSend(ctx.chat.id, reply);
   } catch (err) { stopTyping(); await ctx.reply(`שגיאה: ${err instanceof Error ? err.message : String(err)}`); }
@@ -2144,43 +2102,6 @@ async function handleWizard(chatId: number, text: string, state: WizardState): P
     if (state.stage === "due") {
       wizardStates.delete(chatId);
       await doAddTask(chatId, state.name, state.listName, text);
-      return;
-    }
-  }
-
-  if (state.type === "event") {
-    if (state.stage === "title") {
-      wizardStates.set(chatId, { type: "event", stage: "datetime", title: text });
-      await bot.api.sendMessage(chatId, `*"${text}"*\n\nמתי ובאיזו שעה?\n(לדוגמה: מחר בשעה 14:00, יום ד' 15/7 10:00–11:00)`, { parse_mode: "Markdown" });
-      return;
-    }
-    if (state.stage === "datetime") {
-      wizardStates.delete(chatId);
-      await bot.api.sendMessage(chatId, "⏳ מוסיף ליומן...");
-      try {
-        const reply = await runAgent(chatId, `הוסף אירוע ביומן: "${state.title}" — ${text}. השתמש ב-add_calendar_event.`);
-        await safeSend(chatId, reply);
-      } catch (err) {
-        await bot.api.sendMessage(chatId, `❌ שגיאה ביצירת אירוע: ${err instanceof Error ? err.message : String(err)}`);
-      }
-      return;
-    }
-  }
-
-  if (state.type === "reminder") {
-    if (state.stage === "text") {
-      wizardStates.set(chatId, { type: "reminder", stage: "time", text });
-      await bot.api.sendMessage(chatId, `*"${text}"*\n\nמתי לתזכר?\n(לדוגמה: בעוד שעה, מחר ב-9:00, יום ד' בשעה 15:00)`, { parse_mode: "Markdown" });
-      return;
-    }
-    if (state.stage === "time") {
-      wizardStates.delete(chatId);
-      try {
-        const reply = await runAgent(chatId, `קבע תזכורת: "${state.text}" — ${text}. השתמש ב-set_reminder.`);
-        await safeSend(chatId, reply);
-      } catch (err) {
-        await bot.api.sendMessage(chatId, `❌ שגיאה בתזכורת: ${err instanceof Error ? err.message : String(err)}`);
-      }
       return;
     }
   }
