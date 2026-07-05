@@ -35,6 +35,12 @@ function israelParts(d: Date): { y: number; m: number; d: number; hh: number; mm
   };
 }
 
+/** Wall-clock hour/minute + weekday (0=Sun) in Israel — for DND / scheduling logic. */
+export function israelClock(now = new Date()): { hh: number; mm: number; wd: number } {
+  const p = israelParts(now);
+  return { hh: p.hh, mm: p.mm, wd: p.wd };
+}
+
 /** Current Israel date as "YYYY-MM-DD". */
 export function israelDateStr(now = new Date()): string {
   const p = israelParts(now);

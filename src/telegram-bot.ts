@@ -16,7 +16,7 @@ import { pipeline } from "stream/promises";
 import { fileURLToPath } from "url";
 import { dirname } from "path";
 import { getTasks, addTask, completeTask, getTaskLists, createTaskList, deleteTaskList, deleteTask, moveTask } from "./google-tasks.js";
-import { getCalendarEvents, quickAddCalendarEvent, addCalendarEvent } from "./google-calendar.js";
+import { getCalendarEvents, quickAddCalendarEvent, addCalendarEvent, type CalendarEvent } from "./google-calendar.js";
 import { getUnreadEmails, sendEmail } from "./google-gmail.js";
 import { loadReminders, upsertReminder, deleteReminder, type Reminder } from "./reminder-store.js";
 import { loadUserFacts, upsertFact, deleteFact } from "./user-memory.js";
@@ -27,7 +27,7 @@ import { modelFor, type ModelTier } from "./llm.js";
 import { routeMessage } from "./router.js";
 import { initMcp, getMcpTools, isMcpTool, executeMcpTool } from "./mcp-client.js";
 import { rememberContext, recallContext, seedFromFacts } from "./vector-memory.js";
-import { israelNowISO, israelDateStr as israelDate, israelOffsetStr, toIsraelISO, dateReferenceV2, validateISO } from "./time.js";
+import { israelNowISO, israelDateStr as israelDate, israelOffsetStr, toIsraelISO, dateReferenceV2, validateISO, israelClock } from "./time.js";
 import { githubConfigured, githubOpenIssues, githubCreateIssue, githubCloseIssue } from "./services/github.js";
 import { shopifyConfigured, shopifySummary } from "./services/shopify.js";
 import { logCompletion, getWeekStats } from "./stats-store.js";
@@ -396,52 +396,107 @@ async function freeGapsToday(minMinutes = 30): Promise<Array<{ start: Date; end:
     .filter((g) => g.end.getTime() - g.start.getTime() >= minMinutes * 60000);
 }
 
-async function buildDayPlan(chatId: number): Promise<{ text: string; token: string; count: number } | null> {
-  const open = (await getTasks()).filter((t) => t.status === "needsAction");
-  if (open.length === 0) return null;
-  const top = open
-    .sort((a, b) => (PRIORITY_RANK[priorityOf(a.title)] ?? 4) - (PRIORITY_RANK[priorityOf(b.title)] ?? 4))
-    .slice(0, 3);
+// ── Time-Blocking Engine v2 — conflict-free chronological day plan ────────────
+// Merges existing calendar events with proposed task blocks (🔴=60m 🟡=45m else 30m),
+// skips tasks that ALREADY have a calendar slot, respects buffers, and never overlaps.
 
-  const gaps = await freeGapsToday(30);
-  const blocks: PlanBlock[] = [];
-  let ti = 0;
-  for (const g of gaps) {
-    let cur = new Date(g.start);
-    while (ti < top.length) {
-      const durMs = (priorityOf(top[ti].title) === "🔴" ? 60 : 45) * 60000;
-      if (cur.getTime() + durMs <= g.end.getTime()) {
-        const end = new Date(cur.getTime() + durMs);
-        blocks.push({
-          title: top[ti].title, startISO: toIsraelISO(cur), endISO: toIsraelISO(end),
-          taskRef: { id: top[ti].id, listId: top[ti].listId },
-        });
-        cur = new Date(end.getTime() + 10 * 60000); // 10-min buffer between blocks
-        ti++;
-      } else break;
-    }
-    if (ti >= top.length) break;
-  }
-  if (blocks.length === 0) return null;
-
-  const token = `pl_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-  dayPlans.set(token, { chatId, blocks });
-  const lines = blocks.map((b, i) => `${i + 1}. ${b.title.slice(0, 40)} → ${hhmm(b.startISO)}–${hhmm(b.endISO)}`);
-  const leftover = top.length - blocks.length;
-  const note = leftover > 0 ? `\n\n(${leftover} משימות ללא משבצת פנויה היום)` : "";
-  return { text: `🗓️ התוכנית להיום:\n${lines.join("\n")}${note}`, token, count: blocks.length };
+interface TimeBlock {
+  title: string;
+  startISO: string;
+  endISO: string;
+  taskRef?: TaskRef;
+  type: "meeting" | "task" | "lunch" | "commute";
 }
 
-async function sendDayPlan(chatId: number): Promise<void> {
-  const plan = await buildDayPlan(chatId).catch(() => null);
-  if (!plan) {
-    await bot.api.sendMessage(chatId, "אין משימות פתוחות לשבץ, או שאין חלונות פנויים היום. 🎉", { reply_markup: MAIN_KEYBOARD });
-    return;
+async function buildDayBlocks(): Promise<TimeBlock[]> {
+  const today = israelDate();
+  const off = israelOffsetStr();
+  const now = new Date();
+
+  const [events, tasks] = await Promise.all([
+    getCalendarEvents(`${today}T00:00:00${off}`, `${today}T23:59:59${off}`),
+    getTasks(),
+  ]);
+  const open = tasks.filter((t) => t.status === "needsAction")
+    .sort((a, b) => (PRIORITY_RANK[priorityOf(a.title)] ?? 4) - (PRIORITY_RANK[priorityOf(b.title)] ?? 4));
+
+  // Existing timed events → blocks
+  const blocks: TimeBlock[] = events
+    .filter((e) => e.start && e.end && e.start.includes("T"))
+    .map((e) => ({
+      title: e.summary, startISO: e.start!, endISO: e.end!,
+      type: /ארוח|lunch|צהריים|מנוחה/i.test(e.summary) ? "lunch" as const
+          : /נסיע|commute|דרך/i.test(e.summary) ? "commute" as const : "meeting" as const,
+    }));
+
+  // Free gaps (08:00–19:00, ≥25min, starting no earlier than now+15min)
+  const workStart = new Date(`${today}T08:00:00${off}`);
+  const workEnd = new Date(`${today}T19:00:00${off}`);
+  const floor = now > workStart ? roundUpHalfHour(new Date(now.getTime() + 15 * 60000)) : workStart;
+  const busy = blocks.map((b) => ({ start: new Date(b.startISO), end: new Date(b.endISO) }))
+    .sort((a, b) => a.start.getTime() - b.start.getTime());
+  const gaps: Array<{ start: Date; end: Date }> = [];
+  let cursor = floor;
+  for (const b of busy) {
+    if (b.start.getTime() - cursor.getTime() > 25 * 60000) {
+      gaps.push({ start: new Date(cursor), end: new Date(b.start.getTime() - 10 * 60000) });
+    }
+    if (b.end > cursor) cursor = b.end;
   }
-  await bot.api.sendMessage(chatId, plan.text, {
+  if (workEnd.getTime() - cursor.getTime() > 25 * 60000) gaps.push({ start: new Date(cursor), end: workEnd });
+
+  // Fill gaps with unscheduled tasks (🔴 first). Skip anything already on the calendar.
+  const scheduled = new Set<string>();
+  for (const task of open) {
+    if (scheduled.has(task.id) || hasSlotToday(task.title, events)) continue;
+    const dur = task.title.startsWith("🔴") ? 60 : task.title.startsWith("🟡") ? 45 : 30;
+    const gi = gaps.findIndex((g) => g.end.getTime() - g.start.getTime() >= dur * 60000 && g.start.getTime() > Date.now());
+    if (gi === -1) continue;
+    const gap = gaps[gi];
+    const end = new Date(gap.start.getTime() + dur * 60000);
+    blocks.push({ title: task.title, startISO: toIsraelISO(gap.start), endISO: toIsraelISO(end), taskRef: { id: task.id, listId: task.listId }, type: "task" });
+    scheduled.add(task.id);
+    gap.start = new Date(end.getTime() + 10 * 60000);
+    if (gap.end.getTime() - gap.start.getTime() < 25 * 60000) gaps.splice(gi, 1);
+  }
+
+  return blocks.sort((a, b) => a.startISO.localeCompare(b.startISO));
+}
+
+async function sendDayBlocks(chatId: number): Promise<void> {
+  const blocks = await buildDayBlocks().catch(() => null);
+  if (!blocks) { await bot.api.sendMessage(chatId, "❌ שגיאה בבניית התוכנית", { reply_markup: MAIN_KEYBOARD }); return; }
+
+  const now = israelNowISO();
+  const lines: string[] = ["📅 לוז היום:"];
+  let taskCount = 0;
+  for (const b of blocks) {
+    const marker = b.startISO <= now && b.endISO > now ? "▶️" : b.endISO < now ? "✅" : "•";
+    const typeEmoji = b.type === "meeting" ? "📞" : b.type === "lunch" ? "🍽️" : b.type === "commute" ? "🚗" : "🔧";
+    lines.push(`${marker} ${hhmm(b.startISO)}–${hhmm(b.endISO)} ${typeEmoji} ${b.title.slice(0, 35)}${b.title.length > 35 ? "…" : ""}`);
+    if (b.type === "task" && b.taskRef) taskCount++;
+  }
+
+  // Unscheduled tasks that didn't fit any gap
+  const allOpen = (await getTasks()).filter((t) => t.status === "needsAction");
+  const placedIds = new Set(blocks.filter((b) => b.taskRef).map((b) => b.taskRef!.id));
+  const meetingEvents: CalendarEvent[] = blocks.filter((b) => b.type !== "task")
+    .map((b) => ({ summary: b.title, start: b.startISO, end: b.endISO, id: "", location: null, description: null, htmlLink: null }));
+  const unscheduled = allOpen.filter((t) => !placedIds.has(t.id) && !hasSlotToday(t.title, meetingEvents));
+  if (unscheduled.length > 0) {
+    lines.push("", `❗ ${unscheduled.length} לא שובצו:`);
+    unscheduled.slice(0, 3).forEach((t) => lines.push(`  ${priorityOf(t.title) || "⚪"} ${t.title.replace(/^[🔴🟡🟠⚪]\s*/u, "").slice(0, 30)}`));
+    if (unscheduled.length > 3) lines.push(`  …ועוד ${unscheduled.length - 3}`);
+  }
+
+  const token = `pl_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+  const taskBlocks = blocks.filter((b) => b.type === "task" && b.taskRef);
+  dayPlans.set(token, { chatId, blocks: taskBlocks.map((b) => ({ title: b.title, startISO: b.startISO, endISO: b.endISO, taskRef: b.taskRef! })) });
+
+  await bot.api.sendMessage(chatId, lines.join("\n"), {
     reply_markup: new InlineKeyboard()
-      .text(`✅ קבע הכל ביומן (${plan.count})`, `plan:ok:${plan.token}`).row()
-      .text("📋 לא עכשיו", `plan:skip:${plan.token}`),
+      .text(`✅ קבע ${taskCount} ביומן`, `plan:ok:${token}`).row()
+      .text("🔄 בנה מחדש", "plan:rebuild"),
   });
 }
 
@@ -1003,119 +1058,62 @@ function keepTyping(ctx: { replyWithChatAction: (a: "typing") => Promise<unknown
 // Static instruction core — identical on every call so it (plus the tool
 // definitions) is served from Anthropic's prompt cache: rounds 2+ of every
 // agentic loop and back-to-back messages pay ~10% for this prefix.
-const STATIC_SYSTEM = `You are an elite Executive AI Assistant and thinking partner. Reply ONLY in Hebrew. Sharp, direct, zero fluff.
-Default location: בית חרות, ישראל.
+const STATIC_SYSTEM = `You are a razor-sharp Executive Assistant. Reply ONLY in Hebrew. Direct. No fluff. No "סיכום". No "לסיכום". No "---". No tables. No markdown headers.
 
-## חוקי תאריך/שעה — אל תסטה:
-- אסור לחשב תאריכים בעצמך. כל תאריך חייב להילקח מלוח התאריכים (בהמשך) בלבד.
-- כל מחרוזת ISO חייבת להסתיים ב-offset שכתוב בלוח (קיץ +03:00, חורף +02:00).
-- "מחר"/"מחרתיים"/יום בשבוע → קח את ה-YYYY-MM-DD המדויק מהלוח.
-- שעות: בבוקר=08:00 | בצהריים=12:00 | אחה"צ=15:00 | בערב=18:00 | בלילה=21:00 | ללא שעה→09:00.
-- אם המשתמש נתן שעה מפורשת — השתמש בה כפי שהיא, אל תשנה.
+## DATE RULES — ZERO TOLERANCE:
+1. NEVER compute dates. ONLY use values from the DATE REFERENCE table.
+2. "מחר" = exact ISO from table. "יום שלישי" = exact ISO from table.
+3. Default times: בוקר=08:00 | צהריים=12:00 | אחה"צ=15:00 | ערב=18:00 | לילה=21:00 | ללא שעה=09:00.
+4. If user gives explicit time — USE IT EXACTLY. Never round, never change.
+5. ALWAYS append the correct offset (+03:00 summer, +02:00 winter) from the table.
+6. If a date seems ambiguous (e.g., "יום ראשון" when today IS Sunday) — ask ONE clarifying question.
+7. The system validates every date; if it rejects one, re-ask the user for the time.
 
-## דיוק ואמינות (קריטי):
-- כתוב עברית תקנית בלבד. אסור להמציא מילים, שמות, או עובדות.
-- אם אינך בטוח בפרט — שאל, אל תמציא.
-- אל תאשר פעולה שלא בוצעה בפועל דרך כלי.
+## TASK CREATION — PARSE THEN ACT:
+1. Extract ALL entities from the user message: tasks, events, reminders, contacts, prices, decisions.
+2. Call tools in PARALLEL. Never sequential chains.
+3. After a tool call, report ONLY what was done. One line per action.
+4. NEVER say "נשמע טוב" or "בהצלחה" without doing something concrete.
+5. If user says "יש לי מחר וטרינר" — this is a STATEMENT of commitment, not a request. add_calendar_event IMMEDIATELY. If time missing, ask ONE question only: "באיזו שעה?"
+   - "קבעתי תור לספר ביום חמישי ב-11" / "מגיע טכנאי בין 10 ל-12" → add_calendar_event immediately.
+   - "צריך לתקן את הפנצ'ר" (no time) → add_task (it's a task, not an event).
+   - An event you already recorded this conversation — don't add again.
 
-## CORE PHILOSOPHY — chief of staff, NOT a passive secretary.
-- Don't just log what you're told — PLACE it, PREPARE it, CHASE it. Be proactive.
-- After capturing a task, the system already offers to schedule it (calendar buttons) — NEVER ask "מתי הדדליין" / "כמה זמן לוקח", the buttons handle timing.
-- Anticipate the next step and surface it. Protect the user's time. Close open loops.
-- ONE sharp clarifying question only when genuinely ambiguous ("איזה צוות?" with options). Never an interrogation, never a silent wrong guess. If you can infer, infer.
+## SCHEDULING — PROACTIVE BUT NOT PUSHY:
+- After adding a task, the system offers calendar buttons automatically. NEVER ask "מתי הדדליין" or "כמה זמן לוקח".
+- "תזכיר לי מחר ב-9" → set_reminder IMMEDIATELY with exact ISO from table.
 
-## COMMITMENT CAPTURE — תפוס כל התחייבות, גם כשהיא רק "מוזכרת":
-המשתמש לא תמיד "מבקש" — לפעמים הוא סתם מספר. כל אזכור של התחייבות עתידית = חובה לתעד. אסור להגיב רק "נשמע טוב"/"בהצלחה".
-- "יש לי מחר וטרינר עם הכלבה ב-16:00" → add_calendar_event מיד (התאריך מהלוח!) → "✅ ביומן: וטרינר — מחר 16:00"
-- "יש לי מחר וטרינר" (בלי שעה) → שאלה אחת בלבד: "באיזו שעה?" → כשעונה, add_calendar_event מיד.
-- "קבעתי תור לספר ביום חמישי ב-11" / "אני נוסע לחיפה ביום ג'" / "מגיע טכנאי בין 10 ל-12" → אותו דבר: ביומן, מיד.
-- "צריך לתקן את הפנצ'ר" / "חייב להתקשר לרואה חשבון" (בלי זמן) → add_task מיד (זו משימה, לא אירוע).
-- אירוע שכבר תיעדת בשיחה הזו — אל תוסיף שוב.
+## PRIORITY CLASSIFICATION — AUTO-TAG EVERY TASK (Eisenhower):
+- 🔴 = urgent + important (do today, 60min block)
+- 🟡 = important not urgent (this week, 45min block)
+- 🟠 = urgent not important (delegate or <30min)
+- ⚪ = neither (backlog, no time block)
+Prefix every new task title with its emoji. Classify SILENTLY — never ask "חשוב או דחוף?".
 
-## TELEGRAM FORMAT — HARD RULES (messages render as plain text on a phone):
-- NEVER use markdown tables, NEVER use --- separators, NEVER use ## headers.
-- Short lines. One idea per line. One emoji at line start as a visual anchor.
-- *bold* only for the 2-3 most critical words in the whole message.
-- Briefs: 12 lines MAX. Other replies: 6 lines MAX unless the user asked for detail.
-- Cut everything that doesn't change what the user does in the next hour. No "סיכום", no repetition of what they already know.
+## OUTPUT RULES:
+- Max 6 lines unless the user explicitly asked for detail.
+- One idea per line. One emoji at line start as a visual anchor.
+- *bold* only for the 2-3 most critical words in the entire message.
+- NEVER markdown tables / ## headers / horizontal rules.
+- If nothing actionable: reply "✅" or stay silent. No "סיכום", no repeating what the user knows.
 
-## IRON RULES:
-1. NEVER confirm any action without calling the tool first.
-2. No narration — do it, then report the result + insight.
-3. Auto-route domains silently, never ask for clarification.
-
-## DOMAIN ROUTING:
-- 🚴 SPINZ: אופניים, שלדה, single-speed, ספקי סין/Guangzhou → list "Spinz"
+## DOMAIN ROUTING — AUTO, SILENT:
+- 🚴 SPINZ: bikes, frames, single-speed, suppliers, Guangzhou, China → list "Spinz"
 - 💍 תכשיטים/Onde: Shopify, jewelry, dropshipping, e-commerce → list "תכשיטים"
-- 💼 דינמיקה/Tech: software, Carman S, Next.js, TypeScript, MCP, QC, fleet mgmt → list "דינמיקה"
-- 🚗 רכב דינמיקה: רכבי החברה, טסט/רישוי/ביטוח רכב, מוסך, פסקלים, מלגזות → list "רכב דינמיקה"
+- 💼 דינמיקה: software, Carman S, Next.js, TypeScript, MCP, QC, fleet mgmt → list "דינמיקה"
+- 🚗 רכב דינמיקה: company vehicles, tests, garage, insurance, forklifts → list "רכב דינמיקה"
 - 🏡 חיי בית: Jack Russell, Kia Picanto, Ninja Grill, cooking, fitness, personal → list "חיי בית"
-- 🏠 סולשיין: עומר/וירין/Sunshine → list "סולשיין"
-- No keyword → infer the best-fit domain from meaning; the fallback list is given in the dynamic context below.
-- ONLY these 6 lists exist. NEVER pass any other listName — auto-creating lists is disabled.
+- 🏠 סולשיין: Sunshine House, Omer/Yarin, family → list "סולשיין"
+- No hint → infer from meaning. Fallback list given in the dynamic context.
+- ONLY these 6 lists exist. NEVER create new lists. NEVER ask "לאיזו רשימה?".
 
-## TASKS — ENGAGE, don't just log:
-- Call add_task IMMEDIATELY (no prior confirmation).
-- PRIORITY MATRIX: classify every new task silently (Eisenhower): דחוף+חשוב=🔴 | חשוב=🟡 | דחוף=🟠 | אחר=⚪. Prefix the task title with the emoji (e.g. "🔴 לשלם לספק").
-- After adding, reply only: ✅ נוסף: "<title>" — the system will offer calendar placement buttons automatically.
+## MEMORY — USE, DON'T MENTION:
+- Use stored facts to personalize naturally. Never say "אמרת לי ש..." — just USE the info.
+- User states a decision ("החלטתי", "נסגר על", "לא עושים") → remember_context autonomously.
+- User mentions a spec, config, price, contact → remember_fact autonomously.
 
-## FOLLOW-UP CHAINS — after complete_task:
-- Think: what's the natural NEXT step after this task? Suggest it: "סיימת X — השלב הבא הוא Y, להוסיף כמשימה?"
-- Example: בדק ספק → הצעת מחיר. שלח הצעה → תזכורת מעקב. קנה חלק → התקנה.
-
-## TASK ANALYSIS — whenever you see the task list:
-- Sort by priority emoji: 🔴 first, then 🟡, 🟠, ⚪.
-- Flag tasks with no due date: "חסר דדליין — מתי?"
-- Flag stale tasks: 'updated' older than 3 days from היום שבלוח התאריכים → "פתוחה X ימים — מה חוסם?"
-- If >4 tasks in one domain: "יש לך X משימות ב-[domain] — לסדר עדיפויות?"
-- Always end with: "מה הדבר הכי חשוב להשלים היום?"
-
-## CALENDAR HEALTH — check whenever you see today's events:
-- Back-to-back meetings with no buffer → "⚠️ אין הפסקה בין X ל-Y"
-- No lunch window 12:00-14:00 → "⚠️ אין חלון לארוחת צהריים"
-- Meeting after 20:00 → flag it.
-
-## MORNING BRIEF — full task dump grouped by domain, then context:
-מבנה (ללא טבלאות, ללא ---):
-☀️ <temp>° <desc one word>
-
-📋 כל המשימות הפתוחות (לפי תחום, ממוין 🔴 קודם):
-💼 דינמיקה (N): <task> · <task>
-🚗 רכב דינמיקה (N): <task>
-🚴 SPINZ (N): <task> · <task>
-💍 תכשיטים (N): ...
-🏡 בית (N): ...
-(דלג על תחום ריק)
-
-⚠️ <התרעה אחת חשובה: כמה באיחור / קונפליקט ביומן / מייל דחוף>
-🕐 <חלון פנוי> → <משימה מוצעת>
-
-חוקים: כל משימה בשורה אחת, מקוצרת. תחום ריק — דלג. בלי שאלת סיום.
-
-## REMINDERS — CALL set_reminder IMMEDIATELY:
-- fireAt תמיד מהלוח: "מחר 9" → התאריך של מחר + T09:00:00 + offset מהלוח. "בעוד שעה" → שעה נוכחית +1.
-- Reply: ✅ תזכורת: "<text>" ב-<time>
-
-## CALENDAR:
-- add_calendar_event (Hebrew) / quick_add (English only)
-- startDateTime/endDateTime — תאריך מהלוח + שעה + offset מהלוח. No end→+1h.
-- כל שבוע → RRULE:FREQ=WEEKLY;BYDAY=XX (XX=SU/MO/TU/WE/TH/FR/SA)
-- After adding: ✅ ביומן: "<title>" — check for conflicts with existing events.
-
-## EMAIL:
-- Draft first, show, ask "לשלוח? ✅/❌". send_email ONLY after explicit yes.
-- 48h follow-up reminder auto-set by system.
-
-## MEMORY — extract entities automatically:
-- Names, phones, prices, contacts → remember_fact silently with context.
-- Use stored facts to personalize every response (no "אמרת לי ש..." — just USE the info).
-
-## COMPLEX INPUT — chain of actions:
-Extract ALL entities → run tools in parallel → single synthesized response.
-
-## SEARCH/WEATHER/RATES — use proactively when context suggests it.
-## IMAGES — extract entities (dates/amounts/tasks) → execute → report.
-## SCHEDULING — find_free_slots → proactively suggest time-blocking for open tasks.`;
+## BRIEF FORMAT (when asked for a brief/all tasks):
+☀️ weather one line · then open tasks grouped by domain (💼/🚗/🚴/💍/🏡/🏠), 🔴 first, one line each, skip empty domains · one ⚠️ alert · no closing question.`;
 
 // Anthropic API call with exponential-backoff retry on transient failures
 // (429 rate-limit, 529 overloaded, 5xx). Prevents one flaky moment from
@@ -1194,13 +1192,25 @@ async function runAgent(
 
   // Small per-message dynamic block — the static core + tools live in the
   // prompt cache; only this part changes between calls.
-  const DYNAMIC_SYSTEM = `## הקשר עדכני:
+  // Today's schedule for context (best-effort — never blocks a reply)
+  const todayEvents = await getCalendarEvents(
+    `${israelDateStr}T00:00:00${offsetStr}`, `${israelDateStr}T23:59:59${offsetStr}`
+  ).catch(() => [] as CalendarEvent[]);
+  const scheduleContext = todayEvents.length > 0
+    ? todayEvents.slice(0, 8).map((e) => `  ${e.start?.slice(11, 16) ?? "??"} ${e.summary.slice(0, 32)}`).join("\n")
+    : "(אין אירועים היום)";
+  const fallbackList = activeCtx?.taskList ?? "חיי בית";
+
+  const DYNAMIC_SYSTEM = `## CURRENT CONTEXT:
 Now: ${israelTimeStr}
 
-## DATE REFERENCE — לוח התאריכים (קריטי, ציית בדיוק):
+## DATE REFERENCE — USE THESE EXACT VALUES (copy, never compute):
 ${dateRef}
-- offset נוכחי למחרוזות ISO: "${offsetStr}"
-- רשימת ברירת מחדל כשאין רמז לתחום: "${activeCtx?.taskList ?? "חיי בית"}"${contextSection}${factsSection}${memorySection}`;
+- ISO offset: ${offsetStr}
+- Default task list when no domain hint: "${fallbackList}"
+
+## TODAY'S SCHEDULE:
+${scheduleContext}${contextSection}${factsSection}${memorySection}`;
 
   // Build the user message content
   const userContent: Anthropic.ContentBlockParam[] = extraContent
@@ -1343,6 +1353,118 @@ async function sendScheduled(prompt: string): Promise<void> {
   }
 }
 
+// ── Smart Interrupt Engine ───────────────────────────────────────────────────
+// "Silent by default, loud when it matters." Max 1 interrupt / 30min, deduped,
+// respects DND. Three conditions only: overdue 🔴, unprepared meeting, free gap.
+
+interface Interrupt {
+  priority: "critical" | "high" | "normal";
+  message: string;
+  actions: InlineKeyboard;
+  why: string; // dedup key
+}
+
+/** Minutes between two ISO datetimes (0 if either missing). */
+function eventDurationMin(e: CalendarEvent): number {
+  if (!e.start || !e.end) return 0;
+  return (new Date(e.end).getTime() - new Date(e.start).getTime()) / 60000;
+}
+
+/** Does a task title already have a calendar slot today (fuzzy match)? */
+function hasSlotToday(title: string, events: CalendarEvent[]): boolean {
+  const n = normalizeTitle(title);
+  return events.some((e) => normalizeTitle(e.summary) === n);
+}
+
+/** A timed meeting that likely needs prep. */
+function isImportantMeeting(e: CalendarEvent): boolean {
+  const patterns = /פגישה|שיחה|review|ספק|לקוח|צוות|demo|present|call|זום|teams/i;
+  const dur = eventDurationMin(e);
+  return patterns.test(e.summary) || (dur > 15 && dur < 180);
+}
+
+/** Is there already an open prep task referencing this meeting? */
+async function hasPrepTask(meetingTitle: string): Promise<boolean> {
+  const tasks = await getTasks();
+  const n = normalizeTitle(meetingTitle);
+  return tasks.some((t) =>
+    t.status === "needsAction" &&
+    (normalizeTitle(t.title).includes(n) || n.includes(normalizeTitle(t.title)))
+  );
+}
+
+/** DND: 22:00-07:00 nightly, Friday from 14:00, all Saturday. */
+function isDND(): boolean {
+  const { hh, wd } = israelClock();
+  if (hh >= 22 || hh < 7) return true;
+  if (wd === 5 && hh >= 14) return true;
+  if (wd === 6) return true;
+  return false;
+}
+
+let lastInterruptHash = "";
+let lastInterruptTime = 0;
+const INTERRUPT_COOLDOWN_MS = 30 * 60000;
+
+/** Evaluate all interrupt conditions, sorted by priority. */
+async function evaluateInterrupts(): Promise<Interrupt[]> {
+  const interrupts: Interrupt[] = [];
+  const now = new Date();
+  const today = israelDate();
+  const off = israelOffsetStr();
+
+  const [events, tasks] = await Promise.all([
+    getCalendarEvents(`${today}T00:00:00${off}`, `${today}T23:59:59${off}`),
+    getTasks(),
+  ]);
+  const open = tasks.filter((t) => t.status === "needsAction");
+
+  // 1. CRITICAL: 🔴 overdue and not scheduled today
+  const overdueRed = open.filter((t) => t.title.startsWith("🔴") && isOverdue(t.due) && !hasSlotToday(t.title, events));
+  if (overdueRed.length > 0) {
+    const names = overdueRed.slice(0, 2).map((t) => t.title.replace(/^🔴\s*/, "").slice(0, 30)).join(", ");
+    interrupts.push({
+      priority: "critical",
+      message: `🔥 ${overdueRed.length} משימה קריטית באיחור — לא שובצו להיום\n${names}${overdueRed.length > 2 ? " ועוד…" : ""}`,
+      actions: new InlineKeyboard().text("▶️ שבץ עכשיו", "interrupt:schedule_critical").row().text("📋 הראה רשימה", "interrupt:list_critical"),
+      why: `overdue_red:${overdueRed.length}`,
+    });
+  }
+
+  // 2. HIGH: important meeting in 10-30min without a prep task
+  const upcoming = events.find((e) => {
+    if (!e.start?.includes("T")) return false;
+    const mins = (new Date(e.start).getTime() - now.getTime()) / 60000;
+    return mins > 10 && mins < 30 && isImportantMeeting(e);
+  });
+  if (upcoming && !(await hasPrepTask(upcoming.summary))) {
+    const mins = Math.round((new Date(upcoming.start!).getTime() - now.getTime()) / 60000);
+    interrupts.push({
+      priority: "high",
+      message: `⏰ ${upcoming.summary} בעוד ${mins} דקות\nלא נמצאה משימת הכנה`,
+      actions: new InlineKeyboard().text("➕ הוסף הכנה", `interrupt:prep:${upcoming.id}`).row().text("✅ מוכן", `interrupt:prep_ok:${upcoming.id}`),
+      why: `meeting_prep:${upcoming.id}`,
+    });
+  }
+
+  // 3. HIGH: free gap ≥90min with an unscheduled 🔴 task
+  const gaps = await freeGapsToday(90);
+  const unscheduledRed = open.filter((t) => t.title.startsWith("🔴") && !hasSlotToday(t.title, events));
+  if (gaps.length > 0 && unscheduledRed.length > 0) {
+    const gap = gaps[0];
+    const task = unscheduledRed[0];
+    interrupts.push({
+      priority: "high",
+      message: `🕐 חלון פנוי ${hhmm(toIsraelISO(gap.start))}–${hhmm(toIsraelISO(gap.end))}\n🔴 ${task.title.replace(/^🔴\s*/, "").slice(0, 40)}`,
+      actions: new InlineKeyboard().text("✅ שבץ כאן", `interrupt:slot:${task.id}:${toIsraelISO(gap.start)}`).row().text("⏭️ דחה", "interrupt:dismiss"),
+      why: `free_gap:${task.id}`,
+    });
+  }
+
+  const rank = { critical: 0, high: 1, normal: 2 };
+  return interrupts.sort((a, b) => rank[a.priority] - rank[b.priority]);
+}
+
 // 06:30 — apply recurring task templates (silent unless something was added)
 cron.schedule("30 6 * * *", async () => {
   try {
@@ -1361,70 +1483,69 @@ cron.schedule("30 6 * * *", async () => {
   }
 }, { timezone: "Asia/Jerusalem" });
 
-// 07:00 — morning brief: full task dump across all domains + context
-function morningBriefPrompt(): string {
-  const extras: string[] = [];
-  if (githubConfigured()) extras.push("github_issues — שורת 💻 אם יש issues פתוחים");
-  if (shopifyConfigured()) extras.push("shopify_summary — שורת 🛒 הזמנות/מלאי נמוך");
-  const extraTools = extras.length ? ` בנוסף הרץ: ${extras.join("; ")}.` : "";
-  return (
-    "בריף בוקר. הרץ במקביל: get_tasks (כל הרשימות), מזג אוויר, יומן היום, מיילים." +
-    extraTools +
-    " פלט לפי MORNING BRIEF: שורת מזג אוויר, ואז כל המשימות הפתוחות מקובצות לפי תחום (💼 דינמיקה / 🚗 רכב דינמיקה / 🚴 SPINZ / 💍 תכשיטים / 🏡 בית / 🏠 סולשיין), ממוין 🔴 קודם, כל משימה בשורה. דלג על תחום ריק. הוסף שורת התרעה אחת + הצעת time-block. בלי טבלאות, בלי כותרות, בלי שאלת סיום."
-  );
+// 07:00 — Smart Morning Brief: minimal if nothing urgent, full only when it matters.
+async function smartMorningBrief(): Promise<string | null> {
+  if (!registeredChatId) return null;
+  const open = (await getTasks()).filter((t) => t.status === "needsAction");
+  const redOverdue = open.filter((t) => t.title.startsWith("🔴") && isOverdue(t.due));
+  const redCount = open.filter((t) => t.title.startsWith("🔴")).length;
+
+  // Nothing urgent → one quiet line.
+  if (redOverdue.length === 0 && redCount === 0) {
+    const w = await getWeather().catch(() => null);
+    const temp = w ? `${w.current.temp}° ${w.current.description}` : "";
+    return `☀️ ${temp}\n🎉 אין משימות קריטיות היום. יום טוב!`;
+  }
+
+  return runAgent(registeredChatId,
+    "בריף בוקר. הרץ במקביל: get_tasks (כל הרשימות), מזג אוויר, יומן היום. " +
+    "פלט לפי BRIEF FORMAT — 🔴 באיחור קודם. הצעה אחת מעשית בלבד. בלי שאלת סיום.",
+    undefined, "fast"
+  ).catch(() => null);
 }
+
 cron.schedule("0 7 * * *", async () => {
-  await sendScheduled(morningBriefPrompt());
-  // Offer the one-tap planning ritual right after the brief.
-  if (registeredChatId) {
-    await bot.api.sendMessage(registeredChatId, "רוצה שאשבץ את המשימות החשובות ביומן של היום?", {
-      reply_markup: new InlineKeyboard().text("🗓️ תכנן את היום", "plan:start"),
-    }).catch(() => {});
+  if (!registeredChatId || isDND()) return;
+  const brief = await smartMorningBrief();
+  if (brief) await safeSend(registeredChatId, brief);
+
+  // Offer the day plan only if there are schedulable tasks (not pure backlog).
+  const open = (await getTasks()).filter((t) => t.status === "needsAction");
+  const schedulable = open.filter((t) => !t.title.startsWith("⚪"));
+  if (schedulable.length > 0) {
+    await bot.api.sendMessage(registeredChatId,
+      `🗓️ ${schedulable.length} משימות לשבץ — רוצה תוכנית?`,
+      { reply_markup: new InlineKeyboard().text("תכנן את היום", "plan:start") }
+    ).catch(() => {});
   }
 }, { timezone: "Asia/Jerusalem" });
 
-// Every 30 min — refresh tasks snapshot for the dashboard (Postgres only)
+// Every 30 min 07:00–21:00 — Smart Interrupts ONLY (replaces midday check,
+// evening review, and post-event follow-ups). Silent by default, deduped,
+// max 1 per 30min, DND-aware.
+cron.schedule("*/30 7-21 * * *", async () => {
+  if (!registeredChatId || isDND()) return;
+  if (Date.now() - lastInterruptTime < INTERRUPT_COOLDOWN_MS) return;
+
+  const interrupts = await evaluateInterrupts().catch(() => [] as Interrupt[]);
+  if (interrupts.length === 0) return;
+
+  const top = interrupts[0];
+  const hash = `${top.why}:${top.message.slice(0, 50)}`;
+  if (hash === lastInterruptHash) return; // dedup
+
+  lastInterruptHash = hash;
+  lastInterruptTime = Date.now();
+  await bot.api.sendMessage(registeredChatId, top.message, { reply_markup: top.actions }).catch(() => {});
+}, { timezone: "Asia/Jerusalem" });
+
+// Every 30 min — refresh tasks snapshot for the dashboard (silent background)
 cron.schedule("*/30 * * * *", async () => {
   try {
     await snapshotTasks(await getTasks());
   } catch (err) {
     console.error("[snapshot] failed:", err instanceof Error ? err.message : err);
   }
-}, { timezone: "Asia/Jerusalem" });
-
-// Every 15 min (07:00–21:00) — arm post-event follow-ups from the live calendar
-cron.schedule("*/15 7-21 * * *", async () => {
-  try {
-    await pollEventFollowups();
-  } catch (err) {
-    console.error("[event-followup:poll] failed:", err instanceof Error ? err.message : err);
-  }
-}, { timezone: "Asia/Jerusalem" });
-
-// 12:30 — midday check (3 lines max)
-cron.schedule("30 12 * * *", () => {
-  void (async () => {
-    await sendScheduled(
-      "צ'ק צהריים. הרץ get_tasks. פלט 3 שורות מקסימום: " +
-      "⚠️ המשימה הכי תקועה + 'מה חוסם?' | כמה משימות באיחור | אם הכל בסדר — רק '✅ במסלול'."
-    );
-    // Quick actions — make the nudge actionable, not just informative
-    if (registeredChatId) {
-      await bot.api.sendMessage(registeredChatId, "מה עושים עכשיו?", {
-        reply_markup: new InlineKeyboard()
-          .text("▶️ מה עכשיו", "qa:next").text("➕ יש משימות להוסיף", "qa:add").row()
-          .text("🗓️ תכנן את ההמשך", "plan:start"),
-      }).catch(() => {});
-    }
-  })();
-}, { timezone: "Asia/Jerusalem" });
-
-// 22:00 — evening review (6 lines max)
-cron.schedule("0 22 * * *", () => {
-  sendScheduled(
-    "סיכום ערב. הרץ get_productivity_stats + get_tasks. פלט 5 שורות מקסימום: " +
-    "✅ מה הושלם היום (שורה) | 📌 Top 3 משימות למחר לפי דחיפות (3 שורות) | שאלה אחת קצרה."
-  );
 }, { timezone: "Asia/Jerusalem" });
 
 // Sunday 08:00 — weekly planning (10 lines max + deep-work streams)
@@ -1503,7 +1624,7 @@ bot.hears("📊 בריף", async (ctx) => {
 
 bot.hears("🗓️ תכנן", async (ctx) => {
   await ctx.replyWithChatAction("typing");
-  try { await sendDayPlan(ctx.chat.id); }
+  try { await sendDayBlocks(ctx.chat.id); }
   catch (err) { await ctx.reply(`שגיאה: ${err instanceof Error ? err.message : String(err)}`); }
 });
 
@@ -1829,12 +1950,78 @@ bot.callbackQuery(/^plan:skip:(.+)$/, async (ctx) => {
   await ctx.editMessageText("📋 בסדר — התוכנית לא שובצה ביומן.");
 });
 
+bot.callbackQuery("plan:rebuild", async (ctx) => {
+  const chatId = ctx.chat?.id;
+  await ctx.answerCallbackQuery({ text: "בונה מחדש…" });
+  if (chatId) await sendDayBlocks(chatId).catch((e) => console.error("[plan:rebuild]", e));
+});
+
 bot.callbackQuery("plan:start", async (ctx) => {
   const chatId = ctx.chat?.id;
   await ctx.answerCallbackQuery();
   if (!chatId) return;
   await ctx.editMessageText("🗓️ בונה תוכנית…");
-  await sendDayPlan(chatId).catch((e) => console.error("[plan:start]", e));
+  await sendDayBlocks(chatId).catch((e) => console.error("[plan:start]", e));
+});
+
+// ── Interrupt callbacks ───────────────────────────────────────────────────────
+
+bot.callbackQuery("interrupt:schedule_critical", async (ctx) => {
+  const chatId = ctx.chat?.id;
+  await ctx.answerCallbackQuery({ text: "בונה תוכנית…" });
+  if (chatId) await sendDayBlocks(chatId).catch((e) => console.error("[interrupt:schedule]", e));
+});
+
+bot.callbackQuery("interrupt:list_critical", async (ctx) => {
+  const chatId = ctx.chat?.id;
+  await ctx.answerCallbackQuery();
+  if (!chatId) return;
+  await ctx.editMessageText("📋 משימות קריטיות באיחור:");
+  await refreshTaskCache(chatId);
+  const tasks = taskCache.get(chatId) ?? [];
+  const critical = tasks.filter((t) => t.title.startsWith("🔴") && isOverdue(t.due));
+  if (critical.length === 0) { await ctx.reply("אין משימות קריטיות באיחור כרגע ✅"); return; }
+  const kb = new InlineKeyboard();
+  critical.forEach((t) => kb.text(`🔴 ${t.title.replace(/^🔴\s*/, "").slice(0, 35)}`, `tpick:${tasks.indexOf(t)}`).row());
+  await ctx.reply("בחר משימה לטיפול:", { reply_markup: kb });
+});
+
+bot.callbackQuery(/^interrupt:prep:([^:]+)$/, async (ctx) => {
+  const chatId = ctx.chat?.id;
+  await ctx.answerCallbackQuery();
+  if (!chatId) return;
+  wizardStates.set(chatId, { type: "task", stage: "name" });
+  await ctx.editMessageText("📋 מה צריך להכין לפגישה?\n(כתוב משימה אחת, אני אשבץ אותה לפני הפגישה)");
+});
+
+bot.callbackQuery(/^interrupt:prep_ok:([^:]+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery({ text: "✅ מוכן!" });
+  await ctx.editMessageText("✅ מוכן לפגישה — בהצלחה!");
+});
+
+bot.callbackQuery(/^interrupt:slot:([^:]+):(.+)$/, async (ctx) => {
+  const chatId = ctx.chat?.id;
+  const taskId = ctx.match[1];
+  const startISO = ctx.match[2];
+  await ctx.answerCallbackQuery({ text: "מקבע…" });
+  if (!chatId) return;
+  await refreshTaskCache(chatId);
+  const task = (taskCache.get(chatId) ?? []).find((t) => t.id === taskId);
+  if (!task) { await ctx.editMessageText("❌ המשימה כבר לא זמינה. נסה שוב."); return; }
+  const duration = task.title.startsWith("🔴") ? 60 : 45;
+  const endISO = toIsraelISO(new Date(new Date(startISO).getTime() + duration * 60000));
+  try {
+    await addCalendarEvent(task.title, startISO, endISO);
+    await scheduleCheckIn(chatId, task.title, endISO, { id: task.id, listId: task.listId });
+    await ctx.editMessageText(`✅ שובץ: ${task.title}\n🗓️ ${hhmm(startISO)}–${hhmm(endISO)}`);
+  } catch (e) {
+    await ctx.editMessageText(`❌ שגיאה בשיבוץ: ${e instanceof Error ? e.message : String(e)}`);
+  }
+});
+
+bot.callbackQuery("interrupt:dismiss", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  await ctx.editMessageText("👍 בסדר, אשאל שוב בעוד כמה שעות אם עדיין רלוונטי.");
 });
 
 // ── Quick-action callbacks (midday nudge) ─────────────────────────────────────
@@ -2221,7 +2408,7 @@ bot.command("reminders", async (ctx) => {
 
 bot.command("plan", async (ctx) => {
   await ctx.replyWithChatAction("typing");
-  try { await sendDayPlan(ctx.chat.id); }
+  try { await sendDayBlocks(ctx.chat.id); }
   catch (err) { await ctx.reply(`שגיאה: ${err instanceof Error ? err.message : String(err)}`); }
 });
 
@@ -2529,9 +2716,6 @@ loadChatId().then(async () => {
     else fireReminder(r);
   }
   if (rescheduled > 0) console.log(`[reminders] Rescheduled ${rescheduled} pending reminder(s)`);
-
-  // Arm today's post-event follow-ups immediately (don't wait for the 15-min poll)
-  await pollEventFollowups().catch((err) => console.error("[event-followup:startup]", err));
 
   // Auth health check
   const authOk = await checkGoogleAuth();
