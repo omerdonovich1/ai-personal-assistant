@@ -27,7 +27,7 @@ import { modelFor, type ModelTier } from "./llm.js";
 import { routeMessage } from "./router.js";
 import { initMcp, getMcpTools, isMcpTool, executeMcpTool } from "./mcp-client.js";
 import { rememberContext, recallContext, seedFromFacts } from "./vector-memory.js";
-import { israelNowISO, israelDateStr as israelDate, israelOffsetStr, toIsraelISO, dateReference } from "./time.js";
+import { israelNowISO, israelDateStr as israelDate, israelOffsetStr, toIsraelISO, dateReferenceV2, validateISO } from "./time.js";
 import { githubConfigured, githubOpenIssues, githubCreateIssue, githubCloseIssue } from "./services/github.js";
 import { shopifyConfigured, shopifySummary } from "./services/shopify.js";
 import { logCompletion, getWeekStats } from "./stats-store.js";
@@ -878,7 +878,10 @@ async function executeTool(name: string, input: Record<string, unknown>, chatId:
           await getCalendarEvents(input.timeMin as string | undefined, input.timeMax as string | undefined),
           null, 2
         ); break;
-      case "add_calendar_event":
+      case "add_calendar_event": {
+        // Validation layer: reject dates the model got wrong before hitting Google.
+        const v = validateISO(input.startDateTime as string, "(שעת התחלה)");
+        if (!v.valid) { out = `Error: ${v.error}. בקש מהמשתמש להבהיר את הזמן.`; break; }
         out = JSON.stringify(
           await addCalendarEvent(
             input.summary as string, input.startDateTime as string, input.endDateTime as string,
@@ -886,6 +889,7 @@ async function executeTool(name: string, input: Record<string, unknown>, chatId:
             input.recurrence as string[] | undefined
           ), null, 2
         ); break;
+      }
       case "quick_add_calendar_event":
         out = JSON.stringify(await quickAddCalendarEvent(input.text as string), null, 2); break;
       case "get_unread_emails":
@@ -907,6 +911,8 @@ async function executeTool(name: string, input: Record<string, unknown>, chatId:
         break;
       }
       case "set_reminder": {
+        const v = validateISO(input.fireAt as string, "(זמן התזכורת)");
+        if (!v.valid) { out = `Error: ${v.error}. בקש מהמשתמש להבהיר מתי לתזכר.`; break; }
         const id = `r_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
         const reminder: Reminder = { id, chatId, text: input.text as string, fireAt: input.fireAt as string };
         await upsertReminder(reminder);
@@ -1151,7 +1157,7 @@ async function runAgent(
   const israelTimeStr = israelNowISO(now);
   const israelDateStr = israelDate(now);
   const offsetStr = israelOffsetStr(now);
-  const dateRef = dateReference(now);
+  const dateRef = dateReferenceV2(now);
 
   // Load active context
   const activeCtx = await getActiveContext();
@@ -2070,7 +2076,7 @@ async function convertDateOneShot(dueText: string): Promise<string | undefined> 
       model: "claude-haiku-4-5",
       max_tokens: 100,
       temperature: 0,
-      system: `המר ביטוי זמן בעברית למחרוזת ISO 8601 אחת.\n${dateReference()}\nהחזר אך ורק את המחרוזת (לדוגמה 2026-06-21T09:00:00+03:00), בלי שום טקסט נוסף. ללא שעה → 09:00.`,
+      system: `המר ביטוי זמן בעברית למחרוזת ISO 8601 אחת.\n${dateReferenceV2()}\nהחזר אך ורק את המחרוזת (לדוגמה 2026-06-21T09:00:00+03:00), בלי שום טקסט נוסף. ללא שעה → 09:00.`,
       messages: [{ role: "user", content: dueText }],
     });
     const txt = res.content.filter((b): b is Anthropic.TextBlock => b.type === "text").map((b) => b.text).join("");

@@ -60,10 +60,95 @@ export function toIsraelISO(d: Date): string {
   return `${p.y}-${pad(p.m)}-${pad(p.d)}T${pad(p.hh)}:${pad(p.mm)}:${pad(p.ss)}${offsetStr(d)}`;
 }
 
+// ── v2 Date Resolution — Zero-Error Date Table ────────────────────────────────
+
+const HE_MONTHS = [
+  "ינואר", "פברואר", "מרץ", "אפריל", "מאי", "יוני",
+  "יולי", "אוגוסט", "ספטמבר", "אוקטובר", "נובמבר", "דצמבר",
+];
+
+/** Next occurrence of weekday (0=Sun..6=Sat) as ISO date. If today IS that
+ *  weekday, returns NEXT week unless sameDay=true. */
+export function nextWeekday(targetWd: number, anchor: Date = new Date(), sameDay = false): string {
+  const p = israelParts(anchor);
+  let delta = (targetWd - p.wd + 7) % 7;
+  if (delta === 0 && !sameDay) delta = 7;
+  return israelDateStr(new Date(Date.UTC(p.y, p.m - 1, p.d + delta, 12, 0, 0)));
+}
+
+/** "מחרתיים" — day after tomorrow. */
+export function dayAfterTomorrow(anchor: Date = new Date()): string {
+  const p = israelParts(anchor);
+  return israelDateStr(new Date(Date.UTC(p.y, p.m - 1, p.d + 2, 12, 0, 0)));
+}
+
+/** Add N days to anchor, DST-safe (noon-UTC anchor). */
+export function addDaysDateV2(anchor: Date, n: number): string {
+  const p = israelParts(anchor);
+  return israelDateStr(new Date(Date.UTC(p.y, p.m - 1, p.d + n, 12, 0, 0)));
+}
+
+/** "ב-X לחודש" — this month if still upcoming, else next month. */
+export function nextDayOfMonth(day: number, anchor: Date = new Date()): string {
+  const p = israelParts(anchor);
+  const thisMonth = new Date(Date.UTC(p.y, p.m - 1, day, 12, 0, 0));
+  if (thisMonth.getTime() > anchor.getTime() - 24 * 3600 * 1000) return israelDateStr(thisMonth);
+  return israelDateStr(new Date(Date.UTC(p.y, p.m, day, 12, 0, 0)));
+}
+
+/** Validate a model-produced ISO string: parseable, not in the past, not absurdly far. */
+export function validateISO(iso: string, context = ""): { valid: boolean; error?: string } {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return { valid: false, error: `תאריך לא תקין: "${iso}" ${context}`.trim() };
+  if (d.getTime() < Date.now() - 5 * 60000) return { valid: false, error: `תאריך בעבר: "${iso}" ${context}`.trim() };
+  if (d.getTime() > Date.now() + 180 * 24 * 3600 * 1000) return { valid: false, error: `תאריך רחוק מדי: "${iso}" ${context}`.trim() };
+  return { valid: true };
+}
+
+/** Bulletproof date-reference table for the LLM — it must PICK, never compute. */
+export function dateReferenceV2(now: Date = new Date()): string {
+  const p = israelParts(now);
+  const off = offsetStr(now);
+  const today = israelDateStr(now);
+  const tomorrow = addDaysDateV2(now, 1);
+  const dayAfter = dayAfterTomorrow(now);
+  const pad = (n: number) => String(n).padStart(2, "0");
+
+  const wd = (t: number) => nextWeekday(t, now, false);
+
+  return [
+    `Current time: ${pad(p.hh)}:${pad(p.mm)} (offset ${off})`,
+    `Today (היום): ${HE_DAYS[p.wd]}, ${today} (${p.d} ${HE_MONTHS[p.m - 1]})`,
+    `Tomorrow (מחר): ${tomorrow}`,
+    `Day after tomorrow (מחרתיים): ${dayAfter}`,
+    ``,
+    `WEEKDAY → NEXT OCCURRENCE (use these EXACT values):`,
+    `  - "יום ראשון" = ${wd(0)}`,
+    `  - "יום שני" = ${wd(1)}`,
+    `  - "יום שלישי" = ${wd(2)}`,
+    `  - "יום רביעי" = ${wd(3)}`,
+    `  - "יום חמישי" = ${wd(4)}`,
+    `  - "יום שישי" = ${wd(5)}`,
+    `  - "יום שבת" = ${wd(6)}`,
+    ``,
+    `RELATIVE DATES:`,
+    `  - "בעוד 3 ימים" = ${addDaysDateV2(now, 3)}`,
+    `  - "בעוד שבוע" = ${addDaysDateV2(now, 7)}`,
+    `  - "ב-15 לחודש" = ${nextDayOfMonth(15, now)}`,
+    ``,
+    `HARD RULES — NEVER VIOLATE:`,
+    `1. NEVER compute dates. ONLY copy from the table above.`,
+    `2. "מחר" = ALWAYS ${tomorrow}.`,
+    `3. Weekday names = the NEXT occurrence above (if today is that day, it means next week).`,
+    `4. Default times: morning=08:00 | noon=12:00 | afternoon=15:00 | evening=18:00 | night=21:00 | unspecified=09:00.`,
+    `5. ALWAYS append offset ${off} to ISO strings.`,
+    `6. If a weekday is ambiguous (today IS that weekday) → ask: "הראשון הזה או הבא?"`,
+  ].join("\n");
+}
+
 /**
- * Pre-computed date reference the model looks dates up in — it must never
- * compute them. Covers today/tomorrow/day-after + the next occurrence of every
- * weekday, each with an exact YYYY-MM-DD and the correct offset for ISO building.
+ * @deprecated superseded by dateReferenceV2 — kept for one-line rollback.
+ * Pre-computed date reference the model looks dates up in.
  */
 export function dateReference(now = new Date()): string {
   const tp = israelParts(now);
