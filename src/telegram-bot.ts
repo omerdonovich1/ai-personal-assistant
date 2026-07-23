@@ -342,19 +342,30 @@ async function suggestSlot(priorityEmoji: string): Promise<{ startISO: string; e
   return null;
 }
 
-/** After a task is captured, offer to place it on the calendar (one-tap). */
-async function offerScheduling(chatId: number, title: string, priorityEmoji: string, taskRef?: TaskRef): Promise<void> {
+/** After a task is captured, offer calendar placement. When appendToMessageId
+ *  is given, the buttons are ATTACHED to the existing confirmation message —
+ *  one message per capture, not two (core of the quiet UX). */
+async function offerScheduling(
+  chatId: number, title: string, priorityEmoji: string, taskRef?: TaskRef,
+  appendToMessageId?: number, baseText?: string
+): Promise<void> {
   const sug = await suggestSlot(priorityEmoji).catch(() => null);
   if (!sug) return; // no free slot → stay silent, task is already on the list
   const token = `sl_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
   pendingSlots.set(token, { chatId, title, durationMin: sug.durationMin, startISO: sug.startISO, endISO: sug.endISO, taskRef });
   const when = `${heDay(sug.startISO)} ${hhmm(sug.startISO)}–${hhmm(sug.endISO)}`;
-  await bot.api.sendMessage(chatId, `🗓️ מתי לעבוד על זה?\nהצעה: *${when}*`, {
-    parse_mode: "Markdown",
-    reply_markup: new InlineKeyboard()
-      .text(`✅ קבע ${hhmm(sug.startISO)}`, `sched:ok:${token}`).row()
-      .text("🕐 זמן אחר", `sched:alt:${token}`).text("📋 רק ברשימה", `sched:skip:${token}`),
-  });
+  const kb = new InlineKeyboard()
+    .text(`✅ קבע ${hhmm(sug.startISO)}`, `sched:ok:${token}`).row()
+    .text("🕐 זמן אחר", `sched:alt:${token}`).text("📋 רק ברשימה", `sched:skip:${token}`);
+
+  if (appendToMessageId && baseText) {
+    // Fold the offer into the confirmation message itself.
+    try {
+      await bot.api.editMessageText(chatId, appendToMessageId, `${baseText}\n\n🗓️ הצעה: ${when}`, { reply_markup: kb });
+      return;
+    } catch { /* fall through to a fresh message */ }
+  }
+  await bot.api.sendMessage(chatId, `🗓️ מתי לעבוד על זה?\nהצעה: *${when}*`, { parse_mode: "Markdown", reply_markup: kb });
 }
 
 // ── Progress check-ins ─────────────────────────────────────────────────────────
@@ -500,96 +511,128 @@ async function sendDayBlocks(chatId: number): Promise<void> {
   });
 }
 
-// ── Chronological day timeline ────────────────────────────────────────────────
-// "פרוס לי את המשימות לפי הסדר יום שלי" — merges today's calendar (the real
-// schedule) with open tasks, flagging which tasks already have a time slot
-// (fuzzy title match against events) vs. which still need one.
-
+// (the old standalone timeline view is superseded by the Today Card)
 function normalizeTitle(t: string): string {
   return t.replace(/^[🔴🟡🟠⚪]\s*/u, "").trim().toLowerCase();
 }
 
-async function buildTodayTimeline(): Promise<string> {
+// (post-event follow-up poller removed — its callbacks remain to serve any
+// reminder rows persisted before the quiet-model redesign)
+const postEventPending = new Map<string, { chatId: number; title: string }>();
+
+// ── 📍 Today Card — ONE living, pinned message ────────────────────────────────
+// The heart of the quiet UX: instead of pushing messages all day, a single
+// pinned card is silently EDITED in place (edits don't notify). Alerts that
+// used to be interrupt pings render into the card's status line instead.
+
+let todayCard: { date: string; messageId: number } | null = null;
+let weatherCache: { date: string; line: string } | null = null;
+
+async function loadTodayCardRef(): Promise<void> {
+  try {
+    const facts = await loadUserFacts("_system");
+    const f = facts.find((x) => x.context === "_system" && x.key === "today_card");
+    if (f) todayCard = JSON.parse(f.value) as { date: string; messageId: number };
+  } catch { /* none yet */ }
+}
+
+async function saveTodayCardRef(): Promise<void> {
+  if (todayCard) await upsertFact("today_card", JSON.stringify(todayCard), "_system").catch(() => {});
+}
+
+async function weatherLine(): Promise<string> {
   const date = israelDate();
-  const [events, tasks] = await Promise.all([
-    getCalendarEvents(`${date}T00:00:00${israelOffsetStr()}`, `${date}T23:59:59${israelOffsetStr()}`),
+  if (weatherCache?.date === date) return weatherCache.line;
+  const w = await getWeather().catch(() => null);
+  const line = w ? `☀️ ${w.current.temp}° ${w.current.description}` : "";
+  weatherCache = { date, line };
+  return line;
+}
+
+/** Render the full card: timeline + unscheduled/overdue/done counters + free-gap hint. */
+async function renderTodayCard(): Promise<string> {
+  const date = israelDate();
+  const off = israelOffsetStr();
+  const nowISO = israelNowISO();
+  const [events, tasks, stats, weather] = await Promise.all([
+    getCalendarEvents(`${date}T00:00:00${off}`, `${date}T23:59:59${off}`),
     getTasks(),
+    getWeekStats().catch(() => null),
+    weatherLine(),
   ]);
   const open = tasks.filter((t) => t.status === "needsAction");
-  const timed = events.filter((e) => e.start).sort((a, b) => (a.start! < b.start! ? -1 : 1));
+  const timed = events.filter((e) => e.start?.includes("T")).sort((a, b) => (a.start! < b.start! ? -1 : 1));
 
-  const eventTitles = new Set(timed.map((e) => normalizeTitle(e.summary)));
-  const unscheduled = open
-    .filter((t) => !eventTitles.has(normalizeTitle(t.title)))
-    .sort((a, b) => (PRIORITY_RANK[priorityOf(a.title)] ?? 4) - (PRIORITY_RANK[priorityOf(b.title)] ?? 4));
+  const lines: string[] = [`📍 היום — ${heDay(nowISO)}  (עודכן ${hhmm(nowISO)})`];
+  if (weather) lines.push(weather);
+  lines.push("");
 
-  const nowHHMM = israelNowISO().slice(11, 16);
-  const lines: string[] = [`📅 סדר היום (${date}):`];
   if (timed.length === 0) {
-    lines.push("אין אירועים ביומן היום.");
+    lines.push("🕐 אין אירועים ביומן היום");
   } else {
-    for (const e of timed) {
-      const isTask = eventTitles.has(normalizeTitle(e.summary)) && open.some((t) => normalizeTitle(t.title) === normalizeTitle(e.summary));
-      const startHHMM = e.start!.slice(11, 16);
-      const endHHMM = e.end ? e.end.slice(11, 16) : "";
-      const marker = startHHMM <= nowHHMM && (!endHHMM || endHHMM > nowHHMM) ? "▶️" : "•";
-      lines.push(`${marker} ${startHHMM}${endHHMM ? `–${endHHMM}` : ""}  ${isTask ? "🔧 " : ""}${e.summary}`);
+    for (const e of timed.slice(0, 10)) {
+      const s = e.start!.slice(11, 16), en = e.end ? e.end.slice(11, 16) : "";
+      const nowHH = nowISO.slice(11, 16);
+      const marker = en && en <= nowHH ? "✅" : s <= nowHH && (!en || en > nowHH) ? "▶️" : "•";
+      lines.push(`${marker} ${s}${en ? `–${en}` : ""} ${e.summary.slice(0, 34)}`);
     }
+    if (timed.length > 10) lines.push(`  …ועוד ${timed.length - 10}`);
   }
-  if (unscheduled.length > 0) {
-    lines.push("", "❗ עדיין לא משובצות:");
-    for (const t of unscheduled.slice(0, 6)) lines.push(`  ${priorityOf(t.title) || "⚪"} ${t.title.replace(/^[🔴🟡🟠⚪]\s*/u, "")}`);
-    if (unscheduled.length > 6) lines.push(`  ועוד ${unscheduled.length - 6}...`);
-  }
+  lines.push("");
+
+  // Status line — what used to be interrupt pings lives HERE now.
+  const overdue = open.filter((t) => isOverdue(t.due));
+  const unscheduledRed = open.filter((t) => t.title.startsWith("🔴") && !hasSlotToday(t.title, events));
+  const doneToday = stats?.byDay?.[date] ?? 0;
+  const status: string[] = [];
+  if (unscheduledRed.length) status.push(`🔴 ${unscheduledRed.length} לא שובצו`);
+  if (overdue.length) status.push(`⚠️ ${overdue.length} באיחור`);
+  status.push(`✅ ${doneToday} הושלמו`);
+  lines.push(status.join(" | "));
+
+  // One actionable hint: next free gap ≥45min + the top unscheduled task
+  try {
+    const gaps = await freeGapsToday(45);
+    if (gaps.length > 0 && unscheduledRed.length > 0) {
+      lines.push(`🕐 חלון ${hhmm(toIsraelISO(gaps[0].start))}–${hhmm(toIsraelISO(gaps[0].end))} → ${unscheduledRed[0].title.replace(/^🔴\s*/, "").slice(0, 28)}`);
+    }
+  } catch { /* hint is best-effort */ }
+
   return lines.join("\n");
 }
 
-async function sendTodayTimeline(chatId: number): Promise<void> {
-  const text = await buildTodayTimeline();
-  await bot.api.sendMessage(chatId, text, {
-    reply_markup: new InlineKeyboard().text("🗓️ שבץ את הלא-משובצות", "plan:start"),
-  });
+function todayCardKeyboard(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("▶️ מה עכשיו", "qa:next").text("🗓️ שבץ", "plan:start").row()
+    .text("🔄 רענן", "card:refresh");
 }
 
-// ── Calendar-aware day companion ──────────────────────────────────────────────
-// Follows the user's REAL calendar: when a meeting/event ends, ask what came
-// out of it (new tasks? done?). Anti-spam by design: skips all-day events,
-// long anchor blocks (>3h), bot-placed task blocks (they get check-ins), and
-// titles the user muted with 🔕. Dedup via reminder ids keyed to the event id.
-
-const postEventPending = new Map<string, { chatId: number; title: string }>();
-
-async function getMutedEventTitles(): Promise<Set<string>> {
-  const facts = await loadUserFacts("_system").catch(() => []);
-  return new Set(
-    facts.filter((f) => f.context === "_system" && f.key.startsWith("mute:")).map((f) => f.key.slice(5))
-  );
-}
-
-async function pollEventFollowups(): Promise<void> {
+/** Create (07:00 / on demand) or silently refresh the pinned card. */
+async function upsertTodayCard(createIfMissing: boolean): Promise<void> {
   if (!registeredChatId) return;
   const date = israelDate();
-  const off = israelOffsetStr();
-  const events = await getCalendarEvents(`${date}T00:00:00${off}`, `${date}T23:59:59${off}`);
-  const muted = await getMutedEventTitles();
-  for (const e of events) {
-    if (!e.start || !e.end || !e.start.includes("T")) continue; // all-day → skip
-    const endMs = new Date(e.end).getTime();
-    const durMs = endMs - new Date(e.start).getTime();
-    if (durMs > 3 * 3600_000) continue;                    // long anchor blocks → skip
-    if (PRIORITY_EMOJI.includes([...e.summary][0])) continue; // bot task block → has its own check-in
-    if (muted.has(normalizeTitle(e.summary))) continue;    // user muted this title
-    if (endMs <= Date.now()) continue;                     // already over — don't backfill spam
-    const id = `evtf_${e.id}`;
-    if (scheduledTimeouts.has(id)) continue;               // already armed this run
-    const r: Reminder = {
-      id, chatId: registeredChatId, text: e.summary,
-      fireAt: new Date(endMs).toISOString(),
-      meta: { kind: "event_followup" },
-    };
-    await upsertReminder(r); // idempotent on id → survives restarts without duplicates
-    scheduleReminder(r);
+  const text = await renderTodayCard();
+
+  // Existing card for today → silent in-place edit
+  if (todayCard?.date === date) {
+    try {
+      await bot.api.editMessageText(registeredChatId, todayCard.messageId, text, { reply_markup: todayCardKeyboard() });
+      return;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("message is not modified")) return; // nothing changed — fine
+      // deleted/too old → fall through to recreate (only if allowed)
+    }
   }
+  if (!createIfMissing) return; // silent refresh never sends new messages
+
+  // New day / missing → send fresh card + pin quietly
+  const m = await bot.api.sendMessage(registeredChatId, text, { reply_markup: todayCardKeyboard() });
+  const old = todayCard;
+  todayCard = { date, messageId: m.message_id };
+  await saveTodayCardRef();
+  if (old) await bot.api.unpinChatMessage(registeredChatId, old.messageId).catch(() => {});
+  await bot.api.pinChatMessage(registeredChatId, m.message_id, { disable_notification: true }).catch(() => {});
 }
 
 // ── "מה עכשיו" — rapid execution loop ─────────────────────────────────────────
@@ -1330,16 +1373,22 @@ function chunkText(text: string): string[] {
   return chunks;
 }
 
-async function safeSend(chatId: number, text: string): Promise<void> {
+/** Sends (chunked). Returns the LAST sent message id so callers can attach
+ *  inline buttons to the confirmation instead of sending a second message. */
+async function safeSend(chatId: number, text: string): Promise<number | undefined> {
   const safe = text?.trim();
-  if (!safe) return;
+  if (!safe) return undefined;
+  let lastId: number | undefined;
   for (const chunk of chunkText(safe)) {
     try {
-      await bot.api.sendMessage(chatId, chunk, { parse_mode: "Markdown" });
+      const m = await bot.api.sendMessage(chatId, chunk, { parse_mode: "Markdown" });
+      lastId = m.message_id;
     } catch {
-      await bot.api.sendMessage(chatId, chunk);
+      const m = await bot.api.sendMessage(chatId, chunk);
+      lastId = m.message_id;
     }
   }
+  return lastId;
 }
 
 async function sendScheduled(prompt: string): Promise<void> {
@@ -1353,16 +1402,7 @@ async function sendScheduled(prompt: string): Promise<void> {
   }
 }
 
-// ── Smart Interrupt Engine ───────────────────────────────────────────────────
-// "Silent by default, loud when it matters." Max 1 interrupt / 30min, deduped,
-// respects DND. Three conditions only: overdue 🔴, unprepared meeting, free gap.
-
-interface Interrupt {
-  priority: "critical" | "high" | "normal";
-  message: string;
-  actions: InlineKeyboard;
-  why: string; // dedup key
-}
+// ── Calendar-awareness helpers (used by the Today Card + prep ping) ───────────
 
 /** Minutes between two ISO datetimes (0 if either missing). */
 function eventDurationMin(e: CalendarEvent): number {
@@ -1402,141 +1442,59 @@ function isDND(): boolean {
   return false;
 }
 
-let lastInterruptHash = "";
-let lastInterruptTime = 0;
-const INTERRUPT_COOLDOWN_MS = 30 * 60000;
+// (interrupt-ping engine removed — its alerts render inside the Today Card;
+// the only remaining ping is the meeting-prep check in the */30 cron below)
 
-/** Evaluate all interrupt conditions, sorted by priority. */
-async function evaluateInterrupts(): Promise<Interrupt[]> {
-  const interrupts: Interrupt[] = [];
-  const now = new Date();
-  const today = israelDate();
-  const off = israelOffsetStr();
-
-  const [events, tasks] = await Promise.all([
-    getCalendarEvents(`${today}T00:00:00${off}`, `${today}T23:59:59${off}`),
-    getTasks(),
-  ]);
-  const open = tasks.filter((t) => t.status === "needsAction");
-
-  // 1. CRITICAL: 🔴 overdue and not scheduled today
-  const overdueRed = open.filter((t) => t.title.startsWith("🔴") && isOverdue(t.due) && !hasSlotToday(t.title, events));
-  if (overdueRed.length > 0) {
-    const names = overdueRed.slice(0, 2).map((t) => t.title.replace(/^🔴\s*/, "").slice(0, 30)).join(", ");
-    interrupts.push({
-      priority: "critical",
-      message: `🔥 ${overdueRed.length} משימה קריטית באיחור — לא שובצו להיום\n${names}${overdueRed.length > 2 ? " ועוד…" : ""}`,
-      actions: new InlineKeyboard().text("▶️ שבץ עכשיו", "interrupt:schedule_critical").row().text("📋 הראה רשימה", "interrupt:list_critical"),
-      why: `overdue_red:${overdueRed.length}`,
-    });
-  }
-
-  // 2. HIGH: important meeting in 10-30min without a prep task
-  const upcoming = events.find((e) => {
-    if (!e.start?.includes("T")) return false;
-    const mins = (new Date(e.start).getTime() - now.getTime()) / 60000;
-    return mins > 10 && mins < 30 && isImportantMeeting(e);
-  });
-  if (upcoming && !(await hasPrepTask(upcoming.summary))) {
-    const mins = Math.round((new Date(upcoming.start!).getTime() - now.getTime()) / 60000);
-    interrupts.push({
-      priority: "high",
-      message: `⏰ ${upcoming.summary} בעוד ${mins} דקות\nלא נמצאה משימת הכנה`,
-      actions: new InlineKeyboard().text("➕ הוסף הכנה", `interrupt:prep:${upcoming.id}`).row().text("✅ מוכן", `interrupt:prep_ok:${upcoming.id}`),
-      why: `meeting_prep:${upcoming.id}`,
-    });
-  }
-
-  // 3. HIGH: free gap ≥90min with an unscheduled 🔴 task
-  const gaps = await freeGapsToday(90);
-  const unscheduledRed = open.filter((t) => t.title.startsWith("🔴") && !hasSlotToday(t.title, events));
-  if (gaps.length > 0 && unscheduledRed.length > 0) {
-    const gap = gaps[0];
-    const task = unscheduledRed[0];
-    interrupts.push({
-      priority: "high",
-      message: `🕐 חלון פנוי ${hhmm(toIsraelISO(gap.start))}–${hhmm(toIsraelISO(gap.end))}\n🔴 ${task.title.replace(/^🔴\s*/, "").slice(0, 40)}`,
-      actions: new InlineKeyboard().text("✅ שבץ כאן", `interrupt:slot:${task.id}:${toIsraelISO(gap.start)}`).row().text("⏭️ דחה", "interrupt:dismiss"),
-      why: `free_gap:${task.id}`,
-    });
-  }
-
-  const rank = { critical: 0, high: 1, normal: 2 };
-  return interrupts.sort((a, b) => rank[a.priority] - rank[b.priority]);
-}
-
-// 06:30 — apply recurring task templates (silent unless something was added)
+// 06:30 — apply recurring task templates (fully silent — they show on the card)
 cron.schedule("30 6 * * *", async () => {
   try {
     const due = await popDueToday();
-    if (due.length === 0) return;
     for (const t of due) {
       await addTask(t.title, t.listName);
       console.log(`[recurring] added "${t.title}" → ${t.listName}`);
-    }
-    if (registeredChatId) {
-      const lines = due.map((t) => `• ${t.title} → ${t.listName}`).join("\n");
-      await safeSend(registeredChatId, `🔄 משימות קבועות נוספו להיום:\n${lines}`);
     }
   } catch (err) {
     console.error("[recurring] error:", err);
   }
 }, { timezone: "Asia/Jerusalem" });
 
-// 07:00 — Smart Morning Brief: minimal if nothing urgent, full only when it matters.
-async function smartMorningBrief(): Promise<string | null> {
-  if (!registeredChatId) return null;
-  const open = (await getTasks()).filter((t) => t.status === "needsAction");
-  const redOverdue = open.filter((t) => t.title.startsWith("🔴") && isOverdue(t.due));
-  const redCount = open.filter((t) => t.title.startsWith("🔴")).length;
-
-  // Nothing urgent → one quiet line.
-  if (redOverdue.length === 0 && redCount === 0) {
-    const w = await getWeather().catch(() => null);
-    const temp = w ? `${w.current.temp}° ${w.current.description}` : "";
-    return `☀️ ${temp}\n🎉 אין משימות קריטיות היום. יום טוב!`;
-  }
-
-  return runAgent(registeredChatId,
-    "בריף בוקר. הרץ במקביל: get_tasks (כל הרשימות), מזג אוויר, יומן היום. " +
-    "פלט לפי BRIEF FORMAT — 🔴 באיחור קודם. הצעה אחת מעשית בלבד. בלי שאלת סיום.",
-    undefined, "fast"
-  ).catch(() => null);
-}
-
+// 07:00 — create the day's ONE pinned Today Card. The only scheduled message
+// of the day (weekly crons aside).
 cron.schedule("0 7 * * *", async () => {
   if (!registeredChatId || isDND()) return;
-  const brief = await smartMorningBrief();
-  if (brief) await safeSend(registeredChatId, brief);
-
-  // Offer the day plan only if there are schedulable tasks (not pure backlog).
-  const open = (await getTasks()).filter((t) => t.status === "needsAction");
-  const schedulable = open.filter((t) => !t.title.startsWith("⚪"));
-  if (schedulable.length > 0) {
-    await bot.api.sendMessage(registeredChatId,
-      `🗓️ ${schedulable.length} משימות לשבץ — רוצה תוכנית?`,
-      { reply_markup: new InlineKeyboard().text("תכנן את היום", "plan:start") }
-    ).catch(() => {});
-  }
+  await upsertTodayCard(true).catch((e) => console.error("[card:morning]", e));
 }, { timezone: "Asia/Jerusalem" });
 
-// Every 30 min 07:00–21:00 — Smart Interrupts ONLY (replaces midday check,
-// evening review, and post-event follow-ups). Silent by default, deduped,
-// max 1 per 30min, DND-aware.
+// Every 30 min 07:00–21:00 — SILENT card refresh + the single justified ping:
+// an important meeting starting in 10-30min with no prep task (once per event).
+const prepPinged = new Set<string>();
 cron.schedule("*/30 7-21 * * *", async () => {
   if (!registeredChatId || isDND()) return;
-  if (Date.now() - lastInterruptTime < INTERRUPT_COOLDOWN_MS) return;
+  await upsertTodayCard(false).catch(() => {});
 
-  const interrupts = await evaluateInterrupts().catch(() => [] as Interrupt[]);
-  if (interrupts.length === 0) return;
-
-  const top = interrupts[0];
-  const hash = `${top.why}:${top.message.slice(0, 50)}`;
-  if (hash === lastInterruptHash) return; // dedup
-
-  lastInterruptHash = hash;
-  lastInterruptTime = Date.now();
-  await bot.api.sendMessage(registeredChatId, top.message, { reply_markup: top.actions }).catch(() => {});
+  try {
+    const date = israelDate();
+    const off = israelOffsetStr();
+    const events = await getCalendarEvents(`${date}T00:00:00${off}`, `${date}T23:59:59${off}`);
+    const now = Date.now();
+    const upcoming = events.find((e) => {
+      if (!e.start?.includes("T")) return false;
+      const mins = (new Date(e.start).getTime() - now) / 60000;
+      return mins > 10 && mins < 30 && isImportantMeeting(e) && !prepPinged.has(e.id);
+    });
+    if (upcoming && !(await hasPrepTask(upcoming.summary))) {
+      prepPinged.add(upcoming.id);
+      const mins = Math.round((new Date(upcoming.start!).getTime() - now) / 60000);
+      await bot.api.sendMessage(registeredChatId,
+        `⏰ ${upcoming.summary} בעוד ${mins} דקות — לא נמצאה משימת הכנה`, {
+        reply_markup: new InlineKeyboard()
+          .text("➕ הוסף הכנה", `interrupt:prep:${upcoming.id}`)
+          .text("✅ מוכן", `interrupt:prep_ok:${upcoming.id}`),
+      }).catch(() => {});
+    }
+  } catch (err) {
+    console.error("[prep-ping]", err instanceof Error ? err.message : err);
+  }
 }, { timezone: "Asia/Jerusalem" });
 
 // Every 30 min — refresh tasks snapshot for the dashboard (silent background)
@@ -1630,7 +1588,7 @@ bot.hears("🗓️ תכנן", async (ctx) => {
 
 bot.hears("🕐 סדר יום", async (ctx) => {
   await ctx.replyWithChatAction("typing");
-  try { await sendTodayTimeline(ctx.chat.id); }
+  try { await upsertTodayCard(true); }
   catch (err) { await ctx.reply(`שגיאה: ${err instanceof Error ? err.message : String(err)}`); }
 });
 
@@ -1880,6 +1838,7 @@ async function placeOnCalendar(ctx: Context, title: string, startISO: string, en
   const chatId = ctx.chat?.id;
   if (chatId) await scheduleCheckIn(chatId, title, endISO, taskRef).catch((e) => console.error("[checkin:schedule]", e));
   await ctx.editMessageText(`✅ ביומן: ${title}\n🗓️ ${heDay(startISO)} ${hhmm(startISO)}–${hhmm(endISO)}`);
+  void upsertTodayCard(false).catch(() => {}); // reflect on the card silently
 }
 
 bot.callbackQuery(/^sched:ok:(.+)$/, async (ctx) => {
@@ -1964,27 +1923,7 @@ bot.callbackQuery("plan:start", async (ctx) => {
   await sendDayBlocks(chatId).catch((e) => console.error("[plan:start]", e));
 });
 
-// ── Interrupt callbacks ───────────────────────────────────────────────────────
-
-bot.callbackQuery("interrupt:schedule_critical", async (ctx) => {
-  const chatId = ctx.chat?.id;
-  await ctx.answerCallbackQuery({ text: "בונה תוכנית…" });
-  if (chatId) await sendDayBlocks(chatId).catch((e) => console.error("[interrupt:schedule]", e));
-});
-
-bot.callbackQuery("interrupt:list_critical", async (ctx) => {
-  const chatId = ctx.chat?.id;
-  await ctx.answerCallbackQuery();
-  if (!chatId) return;
-  await ctx.editMessageText("📋 משימות קריטיות באיחור:");
-  await refreshTaskCache(chatId);
-  const tasks = taskCache.get(chatId) ?? [];
-  const critical = tasks.filter((t) => t.title.startsWith("🔴") && isOverdue(t.due));
-  if (critical.length === 0) { await ctx.reply("אין משימות קריטיות באיחור כרגע ✅"); return; }
-  const kb = new InlineKeyboard();
-  critical.forEach((t) => kb.text(`🔴 ${t.title.replace(/^🔴\s*/, "").slice(0, 35)}`, `tpick:${tasks.indexOf(t)}`).row());
-  await ctx.reply("בחר משימה לטיפול:", { reply_markup: kb });
-});
+// ── Prep-ping callbacks (the one justified interrupt) ─────────────────────────
 
 bot.callbackQuery(/^interrupt:prep:([^:]+)$/, async (ctx) => {
   const chatId = ctx.chat?.id;
@@ -1999,32 +1938,14 @@ bot.callbackQuery(/^interrupt:prep_ok:([^:]+)$/, async (ctx) => {
   await ctx.editMessageText("✅ מוכן לפגישה — בהצלחה!");
 });
 
-bot.callbackQuery(/^interrupt:slot:([^:]+):(.+)$/, async (ctx) => {
-  const chatId = ctx.chat?.id;
-  const taskId = ctx.match[1];
-  const startISO = ctx.match[2];
-  await ctx.answerCallbackQuery({ text: "מקבע…" });
-  if (!chatId) return;
-  await refreshTaskCache(chatId);
-  const task = (taskCache.get(chatId) ?? []).find((t) => t.id === taskId);
-  if (!task) { await ctx.editMessageText("❌ המשימה כבר לא זמינה. נסה שוב."); return; }
-  const duration = task.title.startsWith("🔴") ? 60 : 45;
-  const endISO = toIsraelISO(new Date(new Date(startISO).getTime() + duration * 60000));
-  try {
-    await addCalendarEvent(task.title, startISO, endISO);
-    await scheduleCheckIn(chatId, task.title, endISO, { id: task.id, listId: task.listId });
-    await ctx.editMessageText(`✅ שובץ: ${task.title}\n🗓️ ${hhmm(startISO)}–${hhmm(endISO)}`);
-  } catch (e) {
-    await ctx.editMessageText(`❌ שגיאה בשיבוץ: ${e instanceof Error ? e.message : String(e)}`);
-  }
+// ── Today Card callbacks ──────────────────────────────────────────────────────
+
+bot.callbackQuery("card:refresh", async (ctx) => {
+  await ctx.answerCallbackQuery({ text: "🔄 מרענן…" });
+  await upsertTodayCard(true).catch((e) => console.error("[card:refresh]", e));
 });
 
-bot.callbackQuery("interrupt:dismiss", async (ctx) => {
-  await ctx.answerCallbackQuery();
-  await ctx.editMessageText("👍 בסדר, אשאל שוב בעוד כמה שעות אם עדיין רלוונטי.");
-});
-
-// ── Quick-action callbacks (midday nudge) ─────────────────────────────────────
+// ── Quick-action callbacks ────────────────────────────────────────────────────
 
 bot.callbackQuery("qa:next", async (ctx) => {
   const chatId = ctx.chat?.id;
@@ -2084,6 +2005,7 @@ bot.callbackQuery(/^next:done:(\d+)$/, async (ctx) => {
     await logCompletion(done.title, done.listTitle);
     q.idx++;
     await advanceNextUp(ctx, chatId, `✅ ${t.title}`);
+    void upsertTodayCard(false).catch(() => {});
   } catch (err) {
     await ctx.editMessageText(`❌ שגיאה בסגירת המשימה: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -2414,7 +2336,13 @@ bot.command("plan", async (ctx) => {
 
 bot.command("timeline", async (ctx) => {
   await ctx.replyWithChatAction("typing");
-  try { await sendTodayTimeline(ctx.chat.id); }
+  try { await upsertTodayCard(true); }
+  catch (err) { await ctx.reply(`שגיאה: ${err instanceof Error ? err.message : String(err)}`); }
+});
+
+bot.command("today", async (ctx) => {
+  await ctx.replyWithChatAction("typing");
+  try { await upsertTodayCard(true); }
   catch (err) { await ctx.reply(`שגיאה: ${err instanceof Error ? err.message : String(err)}`); }
 });
 
@@ -2563,8 +2491,9 @@ bot.on("message:voice", async (ctx) => {
       "אם זו רק שאלה או שיחה — פשוט ענה. דווח בסוף מה בוצע בשורה אחת לכל פעולה."
     );
     stopTyping();
-    await safeSend(ctx.chat.id, `🎙 "${transcript}"\n\n${reply}`);
-    await maybeOfferScheduling(ctx.chat.id);
+    const fullText = `🎙 "${transcript}"\n\n${reply}`;
+    const msgId = await safeSend(ctx.chat.id, fullText);
+    await maybeOfferScheduling(ctx.chat.id, msgId, fullText.trim());
   } catch (err) {
     stopTyping();
     await ctx.reply(`שגיאה בתמלול: ${err instanceof Error ? err.message : String(err)}`);
@@ -2604,13 +2533,14 @@ bot.on("message:photo", async (ctx) => {
   }
 });
 
-/** If exactly one task was captured this turn, proactively offer to place it on the calendar. */
-async function maybeOfferScheduling(chatId: number): Promise<void> {
+/** If exactly one task was captured this turn, fold slot buttons INTO the
+ *  confirmation message (replyMsgId) — one message per capture, not two. */
+async function maybeOfferScheduling(chatId: number, replyMsgId?: number, replyText?: string): Promise<void> {
   const added = lastAddedTask.get(chatId);
   lastAddedTask.delete(chatId);
   if (added && added.count === 1) {
-    await offerScheduling(chatId, added.title, added.priority, { id: added.id, listId: added.listId }).catch((e) =>
-      console.error("[schedule:offer] failed:", e instanceof Error ? e.message : e));
+    await offerScheduling(chatId, added.title, added.priority, { id: added.id, listId: added.listId }, replyMsgId, replyText)
+      .catch((e) => console.error("[schedule:offer] failed:", e instanceof Error ? e.message : e));
   }
 }
 
@@ -2634,8 +2564,8 @@ bot.on("message:text", async (ctx) => {
   try {
     const reply = await runAgent(chatId, text);
     stopTyping();
-    await safeSend(chatId, reply);
-    await maybeOfferScheduling(chatId);
+    const msgId = await safeSend(chatId, reply);
+    await maybeOfferScheduling(chatId, msgId, reply.trim());
   } catch (err) {
     stopTyping();
     const msg = err instanceof Error ? err.message : String(err);
@@ -2698,6 +2628,9 @@ loadChatId().then(async () => {
 
   // MCP: connect configured external tool servers (no-op when MCP_SERVERS unset)
   await initMcp().catch((err) => console.error("[mcp] init failed:", err));
+
+  // Today Card: recover the pinned card reference so edits survive restarts
+  await loadTodayCardRef();
 
   // Vector memory: one-time seed from legacy user-memory facts
   try {
